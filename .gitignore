@@ -1,4 +1,3 @@
-sents.answer
-sents.out
-sents.test
-sents.train
+.vscode/
+model*
+sents*
