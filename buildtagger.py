@@ -14,7 +14,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch.autograd import Variable
 
 ##### CONSTANTS/SETTINGS #####
 # reproducibility
@@ -36,6 +37,7 @@ GENERATOR_PARAMS = {
 START_TAG = "<START>"
 STOP_TAG = "<STOP>"
 UNKNOWN_TAG = "<UNK>"
+PADDING_TAG = "<PAD>"
 
 # model
 MAX_SENT_LENGTH = 150 # train max is 141
@@ -48,11 +50,15 @@ LEARNING_RATE = 0.5
 
 # preferences
 USE_CPU = False # default False, can overwrite
-PRINT_ROUND = max(int(round(round((30000/BATCH_SIZE)/20, 0)/5,0)*5),5)
-print('Will print for iters in multiples of', PRINT_ROUND)
 BUILDING_MODE = False
 REVIEW_MODE = False
-MINS_TIME_OUT = 9
+if BUILDING_MODE:
+  TOTAL_DATA = 150
+else:
+  TOTAL_DATA = 30000
+PRINT_ROUND = max(int(round(round((TOTAL_DATA/BATCH_SIZE)/20, 0)/5,0)*5),5)
+print('Will print for iters in multiples of', PRINT_ROUND)
+MINS_TIME_OUT = 2
 
 # gpu
 if torch.cuda.is_available() and not USE_CPU:
@@ -146,7 +152,7 @@ class LSTMTagger(nn.Module):
     self.lstm = nn.LSTM(
       self.embedding_dim, 
       self.hidden_dim//2, 
-      batch_first=False,
+      batch_first=True,
       num_layers=1, 
       bidirectional=True
       )
@@ -154,8 +160,8 @@ class LSTMTagger(nn.Module):
     self.hidden2tag = nn.Linear(self.hidden_dim, self.tagset_size)
   
   def init_hidden(self):
-    return (torch.randn(2, self.batch_size, self.hidden_dim//2),
-            torch.randn(2, self.batch_size, self.hidden_dim//2)
+    return (torch.randn(2, MAX_SENT_LENGTH, self.hidden_dim//2),
+            torch.randn(2, MAX_SENT_LENGTH, self.hidden_dim//2)
             )
 
   # def argmax(self, vec):
@@ -217,25 +223,39 @@ class LSTMTagger(nn.Module):
       print('sentence:', sentence.shape)
     embeds = self.word_embeddings(sentence)
     
-    # nn.LSTM expects input shape of (seq, batch, features) assuming batch_first=False
     if REVIEW_MODE:
       print('embeds:', embeds.shape)
       print('embeds.view', embeds.view(sentence.shape[1], self.batch_size, self.embedding_dim).shape)
-    lstm_out, self.hidden = self.lstm(embeds.view(sentence.shape[1], self.batch_size, self.embedding_dim))
+    
+    seq_lengths = []
+    for row in sentence:
+      seq_lengths.append(torch.nonzero(row).shape[0])
+    seq_lengths = torch.LongTensor(seq_lengths).to(device)
+    # seq_tensor = Variable(torch.zeros(MAX_SENT_LENGTH, max(seq_lengths))).long().to(device)
+    lengths_sorted, perm_idx = seq_lengths.sort(0, descending=True)
+    # seq_tensor = seq_tensor[perm_idx]
+    packed_input = pack_padded_sequence(embeds[perm_idx], lengths_sorted, batch_first=True)
+    # print('embeds[seq_tensor].shape:', embeds[seq_tensor].shape)
+    # print('seq_tensor', seq_tensor)
+    # print('packed_input:', packed_input)
+
+    # nn.LSTM expects input shape of (seq, batch, features) assuming batch_first=False
+    packed_output, self.hidden = self.lstm(packed_input)
+    lstm_out, _ = pad_packed_sequence(packed_output, batch_first=True)
+    _, unperm_idx = perm_idx.sort(0)
     #lstm_dropout = F.dropout(lstm_out, p=self.dropout_rate)
     
     # nn.Linear expects the input shape og (batch, *, features)
     if REVIEW_MODE:
       print('lstm_out:', lstm_out.shape)
-      print('lstm_out.view', lstm_out.view(self.batch_size, sentence.shape[1], self.hidden_dim).shape)
-    tag_space = self.hidden2tag(lstm_out.view(self.batch_size, sentence.shape[1], self.hidden_dim))
+      print('lstm_out.view', lstm_out.view(self.batch_size, -1, self.hidden_dim).shape)
+    tag_space = self.hidden2tag(lstm_out[unperm_idx])
     
     if REVIEW_MODE:
       print('tag_space:', tag_space.shape)
-      print(tag_space)
     #tag_scores, predicted = self._viterbi_decode(tag_space.to('cpu'), self.word_to_idx, self.tag_to_idx)
     tag_scores = F.log_softmax(tag_space, dim=1)
-    predicted = torch.argmax(tag_scores.view(self.batch_size, -1, sentence.shape[1]), dim=1)
+    predicted = torch.argmax(tag_scores.view(self.batch_size, self.tagset_size, -1), dim=1)
 
     # print('sentence:', sentence.device)
     # print('embeds:', embeds.device)
@@ -257,8 +277,8 @@ def train(model, training_generator, loss_function, optimizer, epoch):
   # print(model.batch_size)
 
   ##### TRAINING #####
-  while datetime.datetime.now() - start_time < datetime.timedelta(minutes=MINS_TIME_OUT, seconds=30):
-    for idx, (sentence_in, target_out) in enumerate(training_generator):
+  for idx, (sentence_in, target_out) in enumerate(training_generator):
+    if datetime.datetime.now() - start_time < datetime.timedelta(minutes=MINS_TIME_OUT, seconds=30):
       if device != torch.device("cpu"):
         # Move data to GPU if available
         sentence_in, target_out = sentence_in.to(device), target_out.to(device)
@@ -274,7 +294,12 @@ def train(model, training_generator, loss_function, optimizer, epoch):
       if REVIEW_MODE:
         print('tag_scores:', tag_scores.shape)
         print('target_out:', target_out.shape)
-      loss = loss_function(tag_scores.view(BATCH_SIZE, -1, MAX_SENT_LENGTH), target_out)
+      f_tag_scores = tag_scores.view(model.batch_size, model.tagset_size, -1)
+      f_target_out = torch.narrow(target_out, dim=1, start=0, length=f_tag_scores.shape[2])
+      if REVIEW_MODE:
+        print('f_tag_scores:', f_tag_scores.shape)
+        print('f_target_out:', f_target_out.shape)
+      loss = loss_function(f_tag_scores, f_target_out)
       predicted = predicted.detach()
       train_acc = calc_accuracy(predicted, target_out, sentence_in, BATCH_SIZE)
       loss.backward()
@@ -285,7 +310,8 @@ def train(model, training_generator, loss_function, optimizer, epoch):
       
       if idx%PRINT_ROUND==0:
         print('Step {} | Training Loss: {}, Accuracy: {}'.format(idx, round(loss.data.item(),2), round(train_acc*100,2)))
-
+    else:
+      break
   return model, results
 
 def validate(model, validation_generator):
@@ -333,19 +359,18 @@ def load_data_to_generators(train_file):
   ##### load train data #####
   print('Loading data...')
   with open(train_file, 'r') as fp:
-      data = fp.readlines()
+    data = fp.readlines()
   print('Loaded train with', len(data), 'samples...')
 
   ### TRIAL RUN REDUCE DATASET ###
   if BUILDING_MODE:
-      #train_backup = data.copy()
-      print('Building mode activated...')
-      data = data[0:150].copy()
+    print('Building mode activated...')
+    data = data[0:TOTAL_DATA].copy()
 
   # initialise dict
-  char_to_idx = {'<PAD>': 0, UNKNOWN_TAG: 1}
-  word_to_idx = {'<PAD>':0, UNKNOWN_TAG: 1}
-  tag_to_idx = {'<PAD>':0, UNKNOWN_TAG: 1}
+  char_to_idx = {PADDING_TAG: 0, UNKNOWN_TAG: 1}
+  word_to_idx = {PADDING_TAG:0, UNKNOWN_TAG: 1}
+  tag_to_idx = {PADDING_TAG:0, UNKNOWN_TAG: 1}
 
   # 0 is saved for padding
   char_idx = len(char_to_idx.keys())
