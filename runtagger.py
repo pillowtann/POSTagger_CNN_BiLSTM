@@ -12,7 +12,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch.autograd import Variable
 
+IGNORE_CASE = True
 START_TAG = "<START>"
 STOP_TAG = "<STOP>"
 UNKNOWN_TAG = "<UNK>"
@@ -32,7 +35,7 @@ else:
   print("Running on the CPU")
 
 class LSTMTagger(nn.Module):
-  def __init__(self, embedding_dim, hidden_dim, word_to_idx, tag_to_idx, batch_size, dropout_rate, ):
+  def __init__(self, embedding_dim, hidden_dim, word_to_idx, tag_to_idx, batch_size, dropout_rate, pad_idx):
     super(LSTMTagger, self).__init__()
     # init terms
     self.batch_size = batch_size
@@ -43,6 +46,7 @@ class LSTMTagger(nn.Module):
     self.tag_to_idx = tag_to_idx
     self.vocab_size = len(word_to_idx)
     self.tagset_size = len(tag_to_idx)
+    self.pad_idx = pad_idx
 
     # # Matrix of transition parameters.  Entry i,j is the score of
     # # transitioning *to* i *from* j.
@@ -57,12 +61,13 @@ class LSTMTagger(nn.Module):
     # layers
     self.word_embeddings = nn.Embedding(
         num_embeddings = self.vocab_size, 
-        embedding_dim = self.embedding_dim
+        embedding_dim = self.embedding_dim,
+        padding_idx = self.pad_idx
     )
     self.lstm = nn.LSTM(
       self.embedding_dim, 
       self.hidden_dim//2, 
-      batch_first=False,
+      batch_first=True,
       num_layers=1, 
       bidirectional=True
       )
@@ -70,8 +75,8 @@ class LSTMTagger(nn.Module):
     self.hidden2tag = nn.Linear(self.hidden_dim, self.tagset_size)
   
   def init_hidden(self):
-    return (torch.randn(2, self.batch_size, self.hidden_dim//2),
-            torch.randn(2, self.batch_size, self.hidden_dim//2)
+    return (torch.randn(2, MAX_SENT_LENGTH, self.hidden_dim//2),
+            torch.randn(2, MAX_SENT_LENGTH, self.hidden_dim//2)
             )
 
   # def argmax(self, vec):
@@ -133,26 +138,39 @@ class LSTMTagger(nn.Module):
       print('sentence:', sentence.shape)
     embeds = self.word_embeddings(sentence)
     
-    # nn.LSTM expects input shape of (seq, batch, features) assuming batch_first=False
     if REVIEW_MODE:
       print('embeds:', embeds.shape)
       print('embeds.view', embeds.view(sentence.shape[1], self.batch_size, self.embedding_dim).shape)
-    lstm_out, self.hidden = self.lstm(embeds.view(sentence.shape[1], self.batch_size, self.embedding_dim))
-    #lstm_dropout = F.dropout(lstm_out, p=self.dropout_rate)
+    
+    seq_lengths = []
+    for row in sentence:
+      seq_lengths.append(torch.nonzero(row).shape[0])
+    seq_lengths = torch.LongTensor(seq_lengths).to(device)
+    # seq_tensor = Variable(torch.zeros(MAX_SENT_LENGTH, max(seq_lengths))).long().to(device)
+    lengths_sorted, perm_idx = seq_lengths.sort(0, descending=True)
+    # seq_tensor = seq_tensor[perm_idx]
+    packed_input = pack_padded_sequence(embeds[perm_idx], lengths_sorted, batch_first=True)
+    # print('embeds[seq_tensor].shape:', embeds[seq_tensor].shape)
+    # print('seq_tensor', seq_tensor)
+    # print('packed_input:', packed_input)
+
+    # nn.LSTM expects input shape of (seq, batch, features) assuming batch_first=False
+    packed_output, self.hidden = self.lstm(packed_input)
+    lstm_out, _ = pad_packed_sequence(packed_output, batch_first=True)
+    _, unperm_idx = perm_idx.sort(0)
+    lstm_dropout = F.dropout(lstm_out, p=self.dropout_rate)
     
     # nn.Linear expects the input shape og (batch, *, features)
     if REVIEW_MODE:
       print('lstm_out:', lstm_out.shape)
-      print('lstm_out.view', lstm_out.view(self.batch_size, sentence.shape[1], self.hidden_dim).shape)
-    tag_space = self.hidden2tag(lstm_out.view(self.batch_size, sentence.shape[1], self.hidden_dim))
+      print('lstm_out.view', lstm_out.view(self.batch_size, -1, self.hidden_dim).shape)
+    tag_space = self.hidden2tag(lstm_dropout[unperm_idx])
     
     if REVIEW_MODE:
       print('tag_space:', tag_space.shape)
-      print(tag_space)
     #tag_scores, predicted = self._viterbi_decode(tag_space.to('cpu'), self.word_to_idx, self.tag_to_idx)
     tag_scores = F.log_softmax(tag_space, dim=1)
-    predicted = torch.argmax(tag_scores.view(self.batch_size, -1, sentence.shape[1]), dim=1)
-
+    predicted = torch.argmax(tag_scores.view(self.batch_size, self.tagset_size, -1), dim=1)
     return tag_scores, predicted
 
 
@@ -180,28 +198,63 @@ def tag_sentence(test_file, model_file, out_file):
   #print('Loading data...')
   with open(test_file, 'r') as fp:
       test = fp.readlines()
+  test_batch_size = len(test)
   print('Loaded test with', len(test), 'samples...')
   
   ##### load model #####
-  model = torch.load(model_file)
+    # torch.save({
+    # 'epoch': epoch + 1,
+    # 'state_dict': model.state_dict(),
+    # 'optimizer' : optimizer.state_dict(),
+    # 'word_to_idx': model.word_to_idx,
+    # 'tag_to_idx': model.tag_to_idx,
+    # 'embedding_dim': model.embedding_dim,
+    # 'batch_size' : model.batch_size,
+    # 'hidden_dim': model.hidden_dim,
+    # 'dropout_rate': model.dropout_rate,
+    # 'pad_idx': model.pad_idx,
+    # }, model_file)
+  checkpoint = torch.load(model_file) # load model
+  model = LSTMTagger(
+    checkpoint['embedding_dim'], 
+    checkpoint['hidden_dim'], 
+    checkpoint['word_to_idx'],
+    checkpoint['tag_to_idx'],
+    checkpoint['batch_size'],
+    checkpoint['dropout_rate'],
+    checkpoint['pad_idx']
+    ).to(device)
+  model.load_state_dict(checkpoint['state_dict'])
+  #optimizer.load_state_dict(checkpoint['optimizer'])
   model.eval()
 
   ##### format data #####
   _test = []
-  test_batch_size = len(test)
   for row in test:
-    # split the sentence into cleaned word-tag units
-    row_test = [i.rstrip().lower() for i in row.split(' ')]
+    row_test = []
+    for word in row.split(' '):
+      word = word.rstrip()
+      # optional lowercase
+      if IGNORE_CASE: #checkpoint['ignore_case']:
+        word = word.lower()
+      
+      # if word is numeric // [do blind] + tag is CD
+      if (re.sub(r'[^\w]', '', word).isdigit()):
+        word = '<NUM>'
+        chars = ['<NUM>']
+      else:
+        chars = set(list(word))
 
-    row_test = [
-      model.word_to_idx[w] 
-      if w in model.word_to_idx.keys() 
-      else model.word_to_idx[UNKNOWN_TAG] 
-      for w in row_test
-      ]
+      if word not in model.word_to_idx.keys():
+        row_test.append(model.word_to_idx[UNKNOWN_TAG])
+      else:
+        row_test.append(model.word_to_idx[word])
+
     row_test = pad_sequence(row_test)
     _test.append(row_test)
   sentence_in = torch.tensor(_test, dtype=torch.long).view(test_batch_size, MAX_SENT_LENGTH)
+  print(sentence_in.shape)
+  print(sentence_in)
 
   ##### predict #####
   model.batch_size = test_batch_size
@@ -212,6 +265,9 @@ def tag_sentence(test_file, model_file, out_file):
 
     tag_scores, predicted = model(sentence_in)
     predicted = predicted.detach().cpu().numpy()
+  
+  print(predicted.shape)
+  print(predicted)
   
   idx_to_tag = {v: k for k, v in model.tag_to_idx.items()}
   final_output = []
