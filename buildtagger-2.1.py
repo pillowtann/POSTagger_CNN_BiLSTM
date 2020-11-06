@@ -49,7 +49,7 @@ MAX_SENT_LENGTH = 150 # train max is 141
 NUM_EPOCHS = 5
 EMBEDDING_DIM = 100
 HIDDEN_DIM = 50
-BATCH_SIZE = 10
+BATCH_SIZE = 1
 
 DROPOUT_RATE = 0
 MOMENTUM = 0.1
@@ -58,9 +58,8 @@ LEARNING_RATE = 0.5 #1e-1
 
 # preferences
 USE_CPU = False # default False, can overwrite
-BUILDING_MODE = False
+BUILDING_MODE = True
 REVIEW_MODE = False
-TIME_OUT = False # do not change
 if BUILDING_MODE:
   TOTAL_DATA = 20
 else:
@@ -121,9 +120,9 @@ class LSTMTagger(nn.Module):
         self.pad_idx = pad_idx
 
         # layers
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim).to(device)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True).to(device)
-        self.hidden2tag = nn.Linear(hidden_dim, tagset_size).to(device)
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
+        self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
         self.hidden = self.init_hidden(1) # initialising, number does not matter
 
@@ -135,24 +134,24 @@ class LSTMTagger(nn.Module):
 
         # print('sentence.shape:', sentence.shape)
         batch_size, seq_len = sentence.size()
-        embeds = self.word_embeddings(sentence).to(device)
+        embeds = self.word_embeddings(sentence)
         # print('embeds.shape:', embeds.shape)
-        embeds = embeds.contiguous().to(device)
+        embeds = embeds.contiguous()
         # print('embeds.shape:', embeds.shape)
-        input_x = embeds.transpose(1,0).to(device)
+        input_x = embeds.transpose(1,0)
         # print('input_x.shape:', input_x.shape)
         lstm_out, self.hidden = self.lstm(input_x, self.hidden)
         # print('lstm_out.shape:', lstm_out.shape)
         lstm_dropout = self.dropout(lstm_out.contiguous())
         # print('lstm_dropout.shape:', lstm_dropout.shape)
-        tag_space = self.hidden2tag(lstm_dropout).to(device)
+        tag_space = self.hidden2tag(lstm_dropout)
         # print('tag_space.shape:', tag_space.shape)
-        tag_scores = F.log_softmax(tag_space, dim=2).to(device)
+        tag_scores = F.log_softmax(tag_space, dim=2)
         # print('tag_scores.shape:', tag_scores.shape)
         tag_scores = tag_scores.permute(1,2,0).contiguous()
         # print('tag_scores.shape:', tag_scores.shape)
 
-        return tag_scores.to(device)
+        return tag_scores
 
 def load_data_to_generators(train_file):
   """Load data from specified path into train and validate data loaders
@@ -281,8 +280,8 @@ def calc_accuracy(predicted, target_out, batch_size):
   return train_acc
 
 def train_model(train_file, model_file):
-    # write your code here. You can add functions as well.
-	# use torch library to save model parameters, hyperparameters, etc. to model_file
+
+    TIME_OUT = False
 
     training_generator, validation_generator, word_to_ix, tag_to_ix = load_data_to_generators(train_file)
     model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix), PAD_IDX, DROPOUT_RATE).to(device)
