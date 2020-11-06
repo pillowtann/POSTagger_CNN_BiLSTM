@@ -48,14 +48,14 @@ PAD_IDX = 0
 # model
 MAX_SENT_LENGTH = 150 # train max is 141
 NUM_EPOCHS = 5
-EMBEDDING_DIM = 100
-HIDDEN_DIM = 50
+EMBEDDING_DIM = 1000
+HIDDEN_DIM = 500
 BATCH_SIZE = 10
 
 DROPOUT_RATE = 0 # increase slightly to try
-MOMENTUM = 0.1 # increase to try (up to 0.9)
-WEIGHT_DECAY = 1e-4
-LEARNING_RATE = 0.5 #1e-1
+MOMENTUM = 0.8 # increase to try (up to 0.9)
+WEIGHT_DECAY = 1e-4 # not used (unless adam)
+LEARNING_RATE = 1e-1
 
 # preferences
 USE_CPU = False # default False, for overwriting
