@@ -58,7 +58,7 @@ LEARNING_RATE = 0.5 #1e-1
 
 # preferences
 USE_CPU = False # default False, can overwrite
-BUILDING_MODE = False
+BUILDING_MODE = True
 REVIEW_MODE = False
 TIME_OUT = False # do not change
 if BUILDING_MODE:
@@ -125,7 +125,7 @@ class LSTMTagger(nn.Module):
         self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
-        self.hidden = self.init_hidden(1) # initialising, number does not matter
+        self.hidden = self.init_hidden(100) # initialising, number does not matter
 
     def init_hidden(self, seq_length):
         return (torch.zeros(2, seq_length, self.hidden_dim//2).to(device),
@@ -136,23 +136,22 @@ class LSTMTagger(nn.Module):
         # print('sentence.shape:', sentence.shape)
         batch_size, seq_len = sentence.size()
         embeds = self.word_embeddings(sentence)
+        print('embeds.shape:', embeds.shape)
+        # embeds = embeds.contiguous().transpose(1,0)
         # print('embeds.shape:', embeds.shape)
-        embeds = embeds.contiguous()
-        # print('embeds.shape:', embeds.shape)
-        # input_x = embeds.view(seq_len, -1, batch_size)
-        # print('input_x.shape:', input_x.shape)
+        # embeds.shape >>> batch_size X max_seq_len X embedding_dim
         packed_input = pack_padded_sequence(embeds, orig_seq_lengths, batch_first=True)
-        packed_output, self.hidden = self.lstm(packed_input, self.hidden)
+        packed_output, (ht, ct) = self.lstm(packed_input)
         lstm_out, _ = pad_packed_sequence(packed_output, total_length=seq_len, batch_first=True)
-        # print('lstm_out.shape:', lstm_out.shape)
+        print('lstm_out.shape:', lstm_out.shape)
         lstm_dropout = self.dropout(lstm_out.contiguous())
-        # print('lstm_dropout.shape:', lstm_dropout.shape)
+        print('lstm_dropout.shape:', lstm_dropout.shape)
         tag_space = self.hidden2tag(lstm_dropout)
-        # print('tag_space.shape:', tag_space.shape)
+        print('tag_space.shape:', tag_space.shape)
         tag_scores = F.log_softmax(tag_space, dim=2)
-        # print('tag_scores.shape:', tag_scores.shape)
-        tag_scores = tag_scores.contiguous().view(batch_size, -1, seq_len)
-        # print('tag_scores.shape:', tag_scores.shape)
+        print('tag_scores.shape:', tag_scores.shape)
+        tag_scores = tag_scores.permute(0,2,1).contiguous()
+        print('tag_scores.shape:', tag_scores.shape)
 
         return tag_scores
 
@@ -312,6 +311,7 @@ def train_model(train_file, model_file):
                 sentence_lengths.append(torch.nonzero(row).shape[0])
             sentence_lengths = torch.LongTensor(sentence_lengths)
             max_seq_len = max(sentence_lengths)
+            print('max_seq_len:', max_seq_len.data.item())
             seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
 
             seq_lengths = seq_lengths.to(device)
@@ -320,7 +320,7 @@ def train_model(train_file, model_file):
 
             model.zero_grad()
 
-            model.hidden = model.init_hidden(BATCH_SIZE)
+            model.hidden = model.init_hidden(max_seq_len.data.item())
             tag_scores = model(sentence_in, seq_lengths)
             predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
 
