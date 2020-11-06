@@ -60,6 +60,7 @@ LEARNING_RATE = 0.5 #1e-1
 USE_CPU = False # default False, can overwrite
 BUILDING_MODE = False
 REVIEW_MODE = False
+TIME_OUT = False # do not change
 if BUILDING_MODE:
   TOTAL_DATA = 20
 else:
@@ -277,8 +278,8 @@ def calc_accuracy(predicted, target_out, batch_size):
     train_acc = train_acc_num/train_acc_denom
   else:
     # calculates accuracy per batch sample
-    train_acc = sum([1 for pred, act in zip(predicted.squeeze(), target_out.squeeze()) 
-                      if (pred==act) and (act!=0)])/sum([1 for i in target_out.squeeze() if i!=0])
+    train_acc = sum([1 for pred, act in zip(predicted[0], target_out[0]) 
+                      if (pred==act) and (act!=0)])/sum([1 for i in target_out[0] if i!=0])
   return train_acc
 
 def train_model(train_file, model_file):
@@ -301,44 +302,47 @@ def train_model(train_file, model_file):
         
         for idx, (sentence_in, target_out) in enumerate(training_generator):
 
-            if datetime.datetime.now() - start_time < datetime.timedelta(minutes=MINS_TIME_OUT, seconds=30):
-
-                # format batch data
-                sentence_lengths = []
-                for row in sentence_in:
-                    sentence_lengths.append(torch.nonzero(row).shape[0])
-                sentence_lengths = torch.LongTensor(sentence_lengths)
-                seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
-                sentence_in = sentence_in[perm_idx].to(device)
-                target_out = target_out[perm_idx].to(device)
-                seq_lengths = seq_lengths.to(device)
-
-                model.zero_grad()
-
-                model.hidden = model.init_hidden(BATCH_SIZE)
-                tag_scores = model(sentence_in, seq_lengths)
-                predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
-
-                accuracy = calc_accuracy(predicted, target_out, BATCH_SIZE)
-                loss = loss_function(tag_scores, target_out)
-                loss.backward()
-                optimizer.step()
-
-                results['train_loss'].append(loss.data.item())
-                results['train_acc'].append(accuracy)
-
-                if idx%PRINT_ROUND==0:
-                    print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(loss.data.item(),3), round(accuracy*100,3)))
-            
-            else:
-                # time out
+            if datetime.datetime.now() - start_time > datetime.timedelta(minutes=MINS_TIME_OUT, seconds=30):
+                TIME_OUT = True
                 break
+
+            # format batch data
+            sentence_lengths = []
+            for row in sentence_in:
+                sentence_lengths.append(torch.nonzero(row).shape[0])
+            sentence_lengths = torch.LongTensor(sentence_lengths)
+            max_seq_len = max(sentence_lengths)
+            seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
+
+            seq_lengths = seq_lengths.to(device)
+            sentence_in = torch.narrow(sentence_in[perm_idx], dim=1, start=0, length=max_seq_len).to(device)
+            target_out = torch.narrow(target_out[perm_idx], dim=1, start=0, length=max_seq_len).to(device)
+
+            model.zero_grad()
+
+            model.hidden = model.init_hidden(BATCH_SIZE)
+            tag_scores = model(sentence_in, seq_lengths)
+            predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
+
+            accuracy = calc_accuracy(predicted, target_out, BATCH_SIZE)
+            loss = loss_function(tag_scores, target_out)
+            loss.backward()
+            optimizer.step()
+
+            results['train_loss'].append(loss.data.item())
+            results['train_acc'].append(accuracy)
+
+            if idx%PRINT_ROUND==0:
+                print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(loss.data.item(),3), round(accuracy*100,3)))
 
         if BUILDING_MODE and epoch%5==0:
             print(predicted[0])
             print(target_out[0])
 
         results_dict[epoch] = results
+
+        if TIME_OUT:
+            break
 
     torch.save({
         'epoch': epoch + 1,
