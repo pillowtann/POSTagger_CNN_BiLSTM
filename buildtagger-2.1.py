@@ -56,6 +56,7 @@ DROPOUT_RATE = 0 # increase slightly to try
 MOMENTUM = 0.8 # increase to try (up to 0.9)
 WEIGHT_DECAY = 1e-4 # not used (unless adam)
 LEARNING_RATE = 1e-1
+NESTEROV = True
 
 # preferences
 USE_CPU = False # default False, for overwriting
@@ -286,7 +287,7 @@ def train_model(train_file, model_file):
     training_generator, validation_generator, word_to_ix, tag_to_ix = load_data_to_generators(train_file)
     model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix), PAD_IDX, DROPOUT_RATE).to(device)
     loss_function = nn.CrossEntropyLoss(ignore_index = PAD_IDX).to(device)
-    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM)
+    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, nesterov=NESTEROV)
 
     results_dict = {}
     for epoch in range(NUM_EPOCHS):
