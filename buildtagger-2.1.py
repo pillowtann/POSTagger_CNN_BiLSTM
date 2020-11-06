@@ -46,10 +46,10 @@ PAD_IDX = 0
 
 # model
 MAX_SENT_LENGTH = 150 # train max is 141
-NUM_EPOCHS = 30
+NUM_EPOCHS = 5
 EMBEDDING_DIM = 100
 HIDDEN_DIM = 50
-BATCH_SIZE = 1
+BATCH_SIZE = 10
 
 DROPOUT_RATE = 0
 MOMENTUM = 0.1
@@ -58,8 +58,9 @@ LEARNING_RATE = 0.5 #1e-1
 
 # preferences
 USE_CPU = False # default False, can overwrite
-BUILDING_MODE = True
+BUILDING_MODE = False
 REVIEW_MODE = False
+TIME_OUT = False # do not change
 if BUILDING_MODE:
   TOTAL_DATA = 20
 else:
@@ -286,7 +287,7 @@ def train_model(train_file, model_file):
     training_generator, validation_generator, word_to_ix, tag_to_ix = load_data_to_generators(train_file)
     model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix), PAD_IDX, DROPOUT_RATE).to(device)
     loss_function = nn.CrossEntropyLoss(ignore_index = PAD_IDX).to(device)
-    optimizer = optim.SGD(model.parameters(), lr=0.5)
+    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM)
 
     results_dict = {}
     for epoch in range(NUM_EPOCHS):
@@ -294,6 +295,10 @@ def train_model(train_file, model_file):
         results = {'train_loss': [], 'train_acc': []}
         
         for idx, (sentence_in, target_out) in enumerate(training_generator):
+
+            if datetime.datetime.now() - start_time > datetime.timedelta(minutes=MINS_TIME_OUT, seconds=30):
+                TIME_OUT = True
+                break
 
             sentence_in = sentence_in.to(device)
             target_out = target_out.to(device)
@@ -311,8 +316,12 @@ def train_model(train_file, model_file):
             results['train_loss'].append(loss.data.item())
             results['train_acc'].append(accuracy)
 
-            print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(loss.data.item(),3), round(accuracy*100,3)))
+            if idx%PRINT_ROUND==0:
+                print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(loss.data.item(),3), round(accuracy*100,3)))
         
+        if TIME_OUT:
+            break
+
         results_dict[epoch] = results
 
     torch.save({
@@ -322,14 +331,13 @@ def train_model(train_file, model_file):
         'word_to_ix': deepcopy(word_to_ix),
         'tag_to_ix': deepcopy(tag_to_ix),
         'embedding_dim': deepcopy(model.embedding_dim),
-        'batch_size' : deepcopy(BATCH_SIZE),
         'hidden_dim': deepcopy(model.hidden_dim),
         'dropout_rate': deepcopy(model.dropout_rate),
         'pad_idx': deepcopy(model.pad_idx),
         'ignore_case': IGNORE_CASE,
         }, model_file)
     
-    print("--- %s seconds ---" % (datetime.datetime.now() - startTime))
+    print('Time Taken: {}'.format(datetime.datetime.now() - startTime), '-'*60)
     print('Finished...')
 		
 if __name__ == "__main__":
