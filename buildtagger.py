@@ -43,12 +43,12 @@ PAD_IDX = 0
 
 # model
 MAX_SENT_LENGTH = 150 # train max is 141
-NUM_EPOCHS = 20 # default 30?
-EMBEDDING_DIM = 50 #1024
-HIDDEN_DIM = 50 #1024
+NUM_EPOCHS = 30
+EMBEDDING_DIM = 10000
+HIDDEN_DIM = 2048
 BATCH_SIZE = 5
 DROPOUT_RATE = 0.2
-MOMENTUM = 200
+MOMENTUM = 0.1
 WEIGHT_DECAY = 1e-4
 LEARNING_RATE = 0.5 #1e-1
 
@@ -57,7 +57,7 @@ USE_CPU = False # default False, can overwrite
 BUILDING_MODE = True
 REVIEW_MODE = False
 if BUILDING_MODE:
-  TOTAL_DATA = 10
+  TOTAL_DATA = 20
 else:
   TOTAL_DATA = 30000
 PRINT_ROUND = max(int(round(round((TOTAL_DATA/BATCH_SIZE)/20, 0)/5,0)*5),1)
@@ -167,95 +167,35 @@ class LSTMTagger(nn.Module):
     self.dropout = nn.Dropout(self.dropout_rate)
   
   def init_hidden(self, seq_length):
-    return (torch.zeros(2, seq_length, self.hidden_dim).to(device),
-            torch.zeros(2, seq_length, self.hidden_dim).to(device))
+    return (torch.zeros(2, seq_length, self.hidden_dim//2).to(device),
+            torch.zeros(2, seq_length, self.hidden_dim//2).to(device))
 
-  # def argmax(self, vec):
-  #     # return the argmax as a python int
-  #   _, idx = torch.max(vec, 1)
-  #   return idx.item()
-
-  # def _viterbi_decode(self, feats, word_to_ix, tag_to_ix):
-  #   backpointers = []
-
-  #   # Initialize the viterbi variables in log space
-  #   init_vvars = torch.full((1, self.tagset_size), -10000.).to('cpu')
-  #   init_vvars[0][tag_to_ix[START_TAG]] = 0
-
-  #   # forward_var at step i holds the viterbi variables for step i-1
-  #   forward_var = init_vvars
-  #   for feat in feats:
-  #       bptrs_t = []  # holds the backpointers for this step
-  #       viterbivars_t = []  # holds the viterbi variables for this step
-
-  #       for next_tag in range(self.tagset_size):
-  #           # next_tag_var[i] holds the viterbi variable for tag i at the
-  #           # previous step, plus the score of transitioning
-  #           # from tag i to next_tag.
-  #           # We don't include the emission scores here because the max
-  #           # does not depend on them (we add them in below)
-  #           next_tag_var = forward_var.to('cpu') + self.transitions[next_tag].to('cpu')
-  #           best_tag_id = self.argmax(next_tag_var)
-  #           bptrs_t.append(best_tag_id)
-  #           viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
-  #       # Now add in the emission scores, and assign forward_var to the set
-  #       # of viterbi variables we just computed
-  #       forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
-  #       backpointers.append(bptrs_t)
-
-  #   # Transition to STOP_TAG
-  #   print('forward_var.shape:', forward_var.shape)
-  #   print('self.transitions[tag_to_ix[STOP_TAG]]:', self.transitions[tag_to_ix[STOP_TAG]].shape)
-  #   terminal_var = forward_var + self.transitions[tag_to_ix[STOP_TAG]]
-  #   best_tag_id = self.argmax(terminal_var)
-  #   path_score = terminal_var[0][best_tag_id]
-
-  #   # Follow the back pointers to decode the best path.
-  #   best_path = [best_tag_id]
-  #   for bptrs_t in reversed(backpointers):
-  #       best_tag_id = bptrs_t[best_tag_id]
-  #       best_path.append(best_tag_id)
-  #   # Pop off the start tag (we dont want to return that to the caller)
-  #   start = best_path.pop()
-  #   assert start == tag_to_ix[START_TAG]  # Sanity check
-  #   best_path.reverse()
+  def forward(self, sentence, seq_lengths):
+    sentence = sentence.to(device)
+    seq_lengths = seq_lengths.to(device)
     
-  #   return path_score, best_path
-
-  def forward(self, sentence):   
-    self.hidden = self.init_hidden(MAX_SENT_LENGTH)
+    self.hidden = self.init_hidden(BATCH_SIZE)
 
     if REVIEW_MODE:
       print('sentence:', sentence.shape)
     embeds = self.dropout(self.word_embeddings(sentence))
+    embeds = embeds.contiguous()
     
     if REVIEW_MODE:
       print('embeds:', embeds.shape)
       print('embeds.view', embeds.view(sentence.shape[1], self.batch_size, self.embedding_dim).shape)
-    
-    seq_lengths = []
-    for row in sentence:
-      seq_lengths.append(torch.nonzero(row).shape[0])
-    seq_lengths = torch.LongTensor(seq_lengths).to(device)
-    # seq_tensor = Variable(torch.zeros(MAX_SENT_LENGTH, max(seq_lengths))).long().to(device)
-    lengths_sorted, perm_idx = seq_lengths.sort(0, descending=True)
-    # seq_tensor = seq_tensor[perm_idx]
-    packed_input = pack_padded_sequence(embeds[perm_idx], lengths_sorted, batch_first=True)
-    # print('embeds[seq_tensor].shape:', embeds[seq_tensor].shape)
-    # print('seq_tensor', seq_tensor)
-    # print('packed_input:', packed_input)
 
+    packed_input = pack_padded_sequence(embeds, seq_lengths, batch_first=True)
     # nn.LSTM expects input shape of (seq, batch, features) assuming batch_first=False
-    packed_output, self.hidden = self.lstm(packed_input)
-    lstm_out, _ = pad_packed_sequence(packed_output, batch_first=True)
-    _, unperm_idx = perm_idx.sort(0)
-    lstm_dropout = F.dropout(lstm_out.contiguous(), p=self.dropout_rate)
-    
-    # nn.Linear expects the input shape og (batch, *, features)
+    packed_output, self.hidden = self.lstm(packed_input, self.hidden)
+    lstm_out, _ = pad_packed_sequence(packed_output, total_length=MAX_SENT_LENGTH, batch_first=True)
+    # lstm_dropout = F.dropout(lstm_out.contiguous(), p=self.dropout_rate)
     if REVIEW_MODE:
       print('lstm_out:', lstm_out.shape)
       print('lstm_out.view', lstm_out.view(self.batch_size, -1, self.hidden_dim).shape)
-    tag_space = self.hidden2tag(lstm_dropout[unperm_idx])
+    
+    # nn.Linear expects the input shape og (batch, *, features)
+    tag_space = self.hidden2tag(lstm_out)
 
     if REVIEW_MODE:
       print('tag_space:', tag_space.shape)
@@ -263,7 +203,7 @@ class LSTMTagger(nn.Module):
 
     #tag_scores, predicted = self._viterbi_decode(tag_space.to('cpu'), self.word_to_idx, self.tag_to_idx)
     tag_scores = F.log_softmax(tag_space, dim=2)
-    predicted = torch.argmax(tag_scores.view(self.batch_size, self.tagset_size, -1), dim=1)
+    predicted = torch.argmax(tag_scores.contiguous().view(self.batch_size, self.tagset_size, -1), dim=1)
 
     # print('sentence:', sentence.device)
     # print('embeds:', embeds.device)
@@ -274,53 +214,44 @@ class LSTMTagger(nn.Module):
 
     return tag_scores, predicted
 
+def train_step(sentence_in, target_out, model, optimizer, loss_function):
+  sentence_in, target_out = sentence_in.to(device), target_out.to(device)
 
-def train(model, training_generator, loss_function, optimizer, epoch):
+  # format batch data
+  sentence_lengths = []
+  for row in sentence_in:
+    sentence_lengths.append(torch.nonzero(row).shape[0])
+  sentence_lengths = torch.LongTensor(sentence_lengths).to(device)
+  seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
+  sentence_in = sentence_in[perm_idx].to(device)
+  target_out = target_out[perm_idx].to(device)
+
+  model.zero_grad()
+  tag_scores, predicted = model(sentence_in, seq_lengths)
+  f_tag_scores = tag_scores.view(model.batch_size, model.tagset_size, -1)
+  f_target_out = torch.narrow(target_out, dim=1, start=0, length=f_tag_scores.shape[2]).to(device)
+  loss = loss_function(f_tag_scores, f_target_out)
+  predicted = predicted.detach()
+
+  train_acc = calc_accuracy(predicted, f_target_out, BATCH_SIZE)
+  loss.backward()
+  optimizer.step()
+
+  return loss.data.item(), train_acc
+
+def train(model, training_generator, loss_function, optimizer):
   results = {'train_loss': [], 'train_acc': []}
   model.batch_size = BATCH_SIZE # update model with new batch_size
-  # if epoch < NUM_EPOCHS/2 and BATCH_SIZE>50:
-  #   model.batch_size = 50
-  # else:
-  #   model.batch_size = BATCH_SIZE # update model with new batch_size
-  # print(model.batch_size)
-
   ##### TRAINING #####
   for idx, (sentence_in, target_out) in enumerate(training_generator):
     if datetime.datetime.now() - start_time < datetime.timedelta(minutes=MINS_TIME_OUT, seconds=30):
-      if device != torch.device("cpu"):
-        # Move data to GPU if available
-        sentence_in, target_out = sentence_in.to(device), target_out.to(device)
-      if REVIEW_MODE:
-        print(sentence_in.shape)
-        print(target_out.shape)
-      # Step 1. Remember that Pytorch accumulates gradients.
-      # We need to clear them out before each instance
-      model.zero_grad()
-      # Step 3. Run our forward pass.
-      tag_scores, predicted = model(sentence_in)
-      # Step 4. Compute the accuracy, loss, gradients, and update the parameters
-      if REVIEW_MODE:
-        print('tag_scores:', tag_scores.shape)
-        print('target_out:', target_out.shape)
-      f_tag_scores = tag_scores.view(model.batch_size, model.tagset_size, -1)
-      f_target_out = torch.narrow(target_out, dim=1, start=0, length=f_tag_scores.shape[2])
-      if REVIEW_MODE:
-        print('f_tag_scores:', f_tag_scores.shape)
-        print('f_target_out:', f_target_out.shape)
-      loss = loss_function(f_tag_scores, f_target_out)
-      predicted = predicted.detach()
-
-      train_acc = calc_accuracy(predicted, f_target_out, BATCH_SIZE)
-      loss.backward()
-      optimizer.step()
-      # Store Info
-      results['train_loss'].append(loss.data.item())
-      results['train_acc'].append(train_acc)
-
+      metric_loss, metric_acc = train_step(sentence_in, target_out, model, optimizer, loss_function)
+      results['train_loss'].append(metric_loss)
+      results['train_acc'].append(metric_acc)
       if idx%PRINT_ROUND==0:
-        print(predicted)
-        print(f_target_out)
-        print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(loss.data.item(),2), round(train_acc*100,2)))
+        # print(predicted)
+        # print(f_target_out)
+        print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(metric_loss,2), round(metric_acc*100,2)))
     else:
       break
   return model, results
@@ -341,11 +272,17 @@ def validate(model, validation_generator):
   for sentence_in, target_out in validation_generator:
     val_batch_size = len(target_out)
     model.batch_size = val_batch_size # update model with new batch_size 
-    if device != torch.device("cpu"):
-        # Move data to GPU if available
-        sentence_in, target_out = sentence_in.to(device), target_out.to(device)
 
-    tag_scores, predicted = model(sentence_in)
+    # format batch data
+    sentence_lengths = []
+    for row in sentence_in:
+      sentence_lengths.append(torch.nonzero(row).shape[0])
+    sentence_lengths = torch.LongTensor(sentence_lengths)
+    seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
+    sentence_in = sentence_in[perm_idx]
+    target_out = target_out[perm_idx]
+
+    tag_scores, predicted = model(sentence_in, seq_lengths)
     f_tag_scores = tag_scores.view(model.batch_size, model.tagset_size, -1)
     f_target_out = torch.narrow(target_out, dim=1, start=0, length=f_tag_scores.shape[2])
     if REVIEW_MODE:
@@ -553,20 +490,20 @@ def train_model(train_file, model_file):
   torch.cuda.empty_cache()
   training_generator, validation_generator, word_to_idx, tag_to_idx = load_data_to_generators(train_file)
   model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, word_to_idx, tag_to_idx, BATCH_SIZE, DROPOUT_RATE, 0).to(device)
-  pretrained_embeddings = torch.rand(len(word_to_idx), EMBEDDING_DIM)
-  model.word_embeddings.weight.data.copy_(pretrained_embeddings)
-  model.word_embeddings.weight.data[PAD_IDX] = torch.zeros(EMBEDDING_DIM)
+  # pretrained_embeddings = torch.rand(len(word_to_idx), EMBEDDING_DIM)
+  # model.word_embeddings.weight.data.copy_(pretrained_embeddings)
+  # model.word_embeddings.weight.data[PAD_IDX] = torch.zeros(EMBEDDING_DIM)
   loss_function = nn.CrossEntropyLoss(ignore_index = PAD_IDX).to(device)
-  optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE)
+  optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM)
   results_dict = {}
   for epoch in range(NUM_EPOCHS):
     print('Epoch {}'.format(epoch), '-'*80)
-    model, results = train(model, training_generator, loss_function, optimizer, epoch)
+    model, results = train(model, training_generator, loss_function, optimizer)
     if BUILDING_MODE:
       print(results)
     if validation_generator is not None:
       with torch.no_grad():
-          results.update(validate(model, validation_generator)) # validate and update results
+        results.update(validate(model, validation_generator)) # validate and update results
       results_dict[epoch] = results
   torch.save({
     'epoch': epoch + 1,
