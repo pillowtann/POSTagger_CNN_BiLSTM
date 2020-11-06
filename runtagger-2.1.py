@@ -1,6 +1,6 @@
 # python3.5 runtagger.py <test_file_absolute_path> <model_file_absolute_path> <output_file_absolute_path>
 
-
+import datetime
 import os
 import math
 import sys
@@ -15,7 +15,7 @@ import torch.optim as optim
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.autograd import Variable
 
-# RUNTAGGER FULL
+start_time = datetime.datetime.now()
 IGNORE_CASE = True
 START_TAG = "<START>"
 STOP_TAG = "<STOP>"
@@ -49,33 +49,37 @@ class LSTMTagger(nn.Module):
         self.pad_idx = pad_idx
 
         # layers
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim).to(device)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True).to(device)
-        self.hidden2tag = nn.Linear(hidden_dim, tagset_size).to(device)
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
+        self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, sentence):
+    def forward(self, sentence, orig_seq_lengths):
 
         # print('sentence.shape:', sentence.shape)
         batch_size, seq_len = sentence.size()
-        embeds = self.word_embeddings(sentence).to(device)
+        embeds = self.word_embeddings(sentence)
         # print('embeds.shape:', embeds.shape)
-        embeds = embeds.contiguous().to(device)
+        embeds = embeds.contiguous()
         # print('embeds.shape:', embeds.shape)
-        input_x = embeds.transpose(1,0).to(device)
+        input_x = embeds.transpose(1,0)
         # print('input_x.shape:', input_x.shape)
-        lstm_out, (ht, ct) = self.lstm(input_x)
+        packed_input = pack_padded_sequence(input_x, orig_seq_lengths, batch_first=False)
+        # print('packed_input.data.shape:', packed_input.data.shape)
+        packed_output, (ht, ct) = self.lstm(packed_input)
+        # print('packed_output.data.shape:', packed_output.data.shape)
+        lstm_out, input_sizes = pad_packed_sequence(packed_output, total_length=seq_len, batch_first=False)
         # print('lstm_out.shape:', lstm_out.shape)
         lstm_dropout = self.dropout(lstm_out.contiguous())
         # print('lstm_dropout.shape:', lstm_dropout.shape)
-        tag_space = self.hidden2tag(lstm_dropout).to(device)
+        tag_space = self.hidden2tag(lstm_dropout)
         # print('tag_space.shape:', tag_space.shape)
-        tag_scores = F.log_softmax(tag_space, dim=2).to(device)
+        tag_scores = F.log_softmax(tag_space, dim=2)
         # print('tag_scores.shape:', tag_scores.shape)
         tag_scores = tag_scores.permute(1,2,0).contiguous()
         # print('tag_scores.shape:', tag_scores.shape)
 
-        return tag_scores.to(device)
+        return tag_scores
 
 def pad_tensor(tensor, pad_value = 0):
   if MAX_SENT_LENGTH>tensor.shape[0]:
@@ -159,8 +163,8 @@ def tag_sentence(test_file, model_file, out_file):
         row_test = pad_sequence(row_test)
         _test.append(row_test)
     sentences = torch.tensor(_test, dtype=torch.long).view(len(test), MAX_SENT_LENGTH)
-    print(sentences.shape)
-    print(sentences[0:10])
+    # print(sentences.shape)
+    # print(sentences[0:10])
 
     predicted = []
     ##### predict #####
@@ -176,15 +180,26 @@ def tag_sentence(test_file, model_file, out_file):
                 dummy_row.extend([0]*(MAX_SENT_LENGTH-1))
                 sentence_in = torch.cat((sentence_in, torch.tensor([dummy_row,]*n_rows_to_add, dtype=torch.long)), dim=0)
                 print(sentence_in.shape)
-            
-            sentence_in = sentence_in.to(device)
-            tag_scores = model(sentence_in)
+
+            # format batch data
+            sentence_lengths = []
+            for row in sentence_in:
+                sentence_lengths.append(torch.nonzero(row).shape[0])
+            sentence_lengths = torch.LongTensor(sentence_lengths)
+            seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
+            sentence_in = sentence_in[perm_idx].to(device)
+
+            # predict
+            tag_scores = model(sentence_in, seq_lengths).to(device)
             pred = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
-            predicted.extend(pred)
+            
+            # sort back to original order
+            _, unperm_idx = perm_idx.sort(0)
+            predicted.extend(pred[unperm_idx])
 
     predicted = predicted[0:len(test)]
-    print(len(predicted))
-    print(predicted[0:10])
+    # print(len(predicted))
+    # print(predicted[0:10])
   
     idx_to_tag = {v: k for k, v in checkpoint['tag_to_ix'].items()}
     final_output = []
@@ -198,6 +213,7 @@ def tag_sentence(test_file, model_file, out_file):
     with open(out_file, "w") as output:
         output.write('\n'.join(final_output))
 
+    print('Time Taken: {}'.format(datetime.datetime.now() - start_time), '-'*60)
     print('Finished...')
 
 if __name__ == "__main__":

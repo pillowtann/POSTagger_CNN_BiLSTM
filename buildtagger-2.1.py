@@ -18,8 +18,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 import torch.optim as optim
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-startTime = datetime.datetime.now()
+start_time = datetime.datetime.now()
 
 ##### CONSTANTS/SETTINGS #####
 # reproducibility
@@ -49,16 +50,16 @@ MAX_SENT_LENGTH = 150 # train max is 141
 NUM_EPOCHS = 5
 EMBEDDING_DIM = 100
 HIDDEN_DIM = 50
-BATCH_SIZE = 1
+BATCH_SIZE = 10
 
-DROPOUT_RATE = 0
-MOMENTUM = 0.1
+DROPOUT_RATE = 0 # increase slightly to try
+MOMENTUM = 0.1 # increase to try (up to 0.9)
 WEIGHT_DECAY = 1e-4
 LEARNING_RATE = 0.5 #1e-1
 
 # preferences
-USE_CPU = False # default False, can overwrite
-BUILDING_MODE = True
+USE_CPU = False # default False, for overwriting
+BUILDING_MODE = False
 REVIEW_MODE = False
 if BUILDING_MODE:
   TOTAL_DATA = 20
@@ -125,7 +126,7 @@ class LSTMTagger(nn.Module):
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, sentence):
+    def forward(self, sentence, orig_seq_lengths):
 
         # print('sentence.shape:', sentence.shape)
         batch_size, seq_len = sentence.size()
@@ -135,7 +136,11 @@ class LSTMTagger(nn.Module):
         # print('embeds.shape:', embeds.shape)
         input_x = embeds.transpose(1,0)
         # print('input_x.shape:', input_x.shape)
-        lstm_out, (ht, ct) = self.lstm(input_x)
+        packed_input = pack_padded_sequence(input_x, orig_seq_lengths, batch_first=False)
+        # print('packed_input.data.shape:', packed_input.data.shape)
+        packed_output, (ht, ct) = self.lstm(packed_input)
+        # print('packed_output.data.shape:', packed_output.data.shape)
+        lstm_out, input_sizes = pad_packed_sequence(packed_output, total_length=seq_len, batch_first=False)
         # print('lstm_out.shape:', lstm_out.shape)
         lstm_dropout = self.dropout(lstm_out.contiguous())
         # print('lstm_dropout.shape:', lstm_dropout.shape)
@@ -294,11 +299,23 @@ def train_model(train_file, model_file):
                 TIME_OUT = True
                 break
 
-            sentence_in = sentence_in.to(device)
-            target_out = target_out.to(device)
+            # format batch data
+            sentence_lengths = []
+            for row in sentence_in:
+                sentence_lengths.append(torch.nonzero(row).shape[0])
+            sentence_lengths = torch.LongTensor(sentence_lengths)
+            max_seq_len = max(sentence_lengths)
+            seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
+
+            seq_lengths = seq_lengths.to(device)
+            sentence_in = torch.narrow(sentence_in[perm_idx], dim=1, start=0, length=max_seq_len).to(device)
+            target_out = torch.narrow(target_out[perm_idx], dim=1, start=0, length=max_seq_len).to(device)
+
+            # sentence_in = sentence_in.to(device)
+            # target_out = target_out.to(device)
             model.zero_grad()
 
-            tag_scores = model(sentence_in).to(device)
+            tag_scores = model(sentence_in, seq_lengths).to(device)
             predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
 
             accuracy = calc_accuracy(predicted, target_out, BATCH_SIZE)
@@ -330,7 +347,7 @@ def train_model(train_file, model_file):
         'ignore_case': IGNORE_CASE,
         }, model_file)
     
-    print('Time Taken: {}'.format(datetime.datetime.now() - startTime), '-'*60)
+    print('Time Taken: {}'.format(datetime.datetime.now() - start_time), '-'*60)
     print('Finished...')
 		
 if __name__ == "__main__":
