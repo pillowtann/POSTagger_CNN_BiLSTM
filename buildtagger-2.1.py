@@ -124,11 +124,6 @@ class LSTMTagger(nn.Module):
         self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
-        self.hidden = self.init_hidden(1) # initialising, number does not matter
-
-    def init_hidden(self, seq_length):
-        return (torch.zeros(2, seq_length, self.hidden_dim//2).to(device),
-                torch.zeros(2, seq_length, self.hidden_dim//2).to(device))
 
     def forward(self, sentence):
 
@@ -140,7 +135,7 @@ class LSTMTagger(nn.Module):
         # print('embeds.shape:', embeds.shape)
         input_x = embeds.transpose(1,0)
         # print('input_x.shape:', input_x.shape)
-        lstm_out, self.hidden = self.lstm(input_x, self.hidden)
+        lstm_out, (ht, ct) = self.lstm(input_x)
         # print('lstm_out.shape:', lstm_out.shape)
         lstm_dropout = self.dropout(lstm_out.contiguous())
         # print('lstm_dropout.shape:', lstm_dropout.shape)
@@ -303,7 +298,6 @@ def train_model(train_file, model_file):
             target_out = target_out.to(device)
             model.zero_grad()
 
-            model.hidden = model.init_hidden(MAX_SENT_LENGTH)
             tag_scores = model(sentence_in).to(device)
             predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
 
