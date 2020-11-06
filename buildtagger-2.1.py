@@ -47,10 +47,11 @@ PAD_IDX = 0
 # model
 MAX_SENT_LENGTH = 150 # train max is 141
 NUM_EPOCHS = 30
-EMBEDDING_DIM = 10000
-HIDDEN_DIM = 2048
-BATCH_SIZE = 5
-DROPOUT_RATE = 0.2
+EMBEDDING_DIM = 100
+HIDDEN_DIM = 50
+BATCH_SIZE = 1
+
+DROPOUT_RATE = 0
 MOMENTUM = 0.1
 WEIGHT_DECAY = 1e-4
 LEARNING_RATE = 0.5 #1e-1
@@ -137,9 +138,9 @@ class LSTMTagger(nn.Module):
         # print('embeds.shape:', embeds.shape)
         embeds = embeds.contiguous().to(device)
         # print('embeds.shape:', embeds.shape)
-        # input_x = embeds.view(seq_len, -1, batch_size).to(device)
+        input_x = embeds.transpose(1,0).to(device)
         # print('input_x.shape:', input_x.shape)
-        lstm_out, self.hidden = self.lstm(embeds, self.hidden)
+        lstm_out, self.hidden = self.lstm(input_x, self.hidden)
         # print('lstm_out.shape:', lstm_out.shape)
         lstm_dropout = self.dropout(lstm_out.contiguous())
         # print('lstm_dropout.shape:', lstm_dropout.shape)
@@ -147,7 +148,7 @@ class LSTMTagger(nn.Module):
         # print('tag_space.shape:', tag_space.shape)
         tag_scores = F.log_softmax(tag_space, dim=2).to(device)
         # print('tag_scores.shape:', tag_scores.shape)
-        tag_scores = tag_scores.contiguous().view(batch_size, -1, seq_len)
+        tag_scores = tag_scores.permute(1,2,0).contiguous()
         # print('tag_scores.shape:', tag_scores.shape)
 
         return tag_scores.to(device)
@@ -274,8 +275,8 @@ def calc_accuracy(predicted, target_out, batch_size):
     train_acc = train_acc_num/train_acc_denom
   else:
     # calculates accuracy per batch sample
-    train_acc = sum([1 for pred, act in zip(predicted.squeeze(), target_out.squeeze()) 
-                      if (pred==act) and (act!=0)])/sum([1 for i in target_out.squeeze() if i!=0])
+    train_acc = sum([1 for pred, act in zip(predicted[0], target_out[0]) 
+                      if (pred==act) and (act!=0)])/sum([1 for i in target_out[0] if i!=0])
   return train_acc
 
 def train_model(train_file, model_file):
@@ -298,7 +299,7 @@ def train_model(train_file, model_file):
             target_out = target_out.to(device)
             model.zero_grad()
 
-            model.hidden = model.init_hidden(BATCH_SIZE)
+            model.hidden = model.init_hidden(MAX_SENT_LENGTH)
             tag_scores = model(sentence_in).to(device)
             predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
 
@@ -321,7 +322,7 @@ def train_model(train_file, model_file):
         'word_to_ix': deepcopy(word_to_ix),
         'tag_to_ix': deepcopy(tag_to_ix),
         'embedding_dim': deepcopy(model.embedding_dim),
-        'batch_size' : deepcopy(model.batch_size),
+        'batch_size' : deepcopy(BATCH_SIZE),
         'hidden_dim': deepcopy(model.hidden_dim),
         'dropout_rate': deepcopy(model.dropout_rate),
         'pad_idx': deepcopy(model.pad_idx),
