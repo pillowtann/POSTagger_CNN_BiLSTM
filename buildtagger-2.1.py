@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 import torch.optim as optim
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 startTime = datetime.datetime.now()
 
@@ -31,7 +32,7 @@ torch.backends.cudnn.deterministic = True
 
 # data set-up
 IGNORE_CASE = True
-VAL_PROP = 0.2
+VAL_PROP = 0
 GENERATOR_PARAMS = {
     'shuffle': True,
     'num_workers': 1,
@@ -47,9 +48,9 @@ PAD_IDX = 0
 # model
 MAX_SENT_LENGTH = 150 # train max is 141
 NUM_EPOCHS = 30
-EMBEDDING_DIM = 10000
-HIDDEN_DIM = 2048
-BATCH_SIZE = 5
+EMBEDDING_DIM = 100
+HIDDEN_DIM = 50
+BATCH_SIZE = 1
 DROPOUT_RATE = 0.2
 MOMENTUM = 0.1
 WEIGHT_DECAY = 1e-4
@@ -57,7 +58,7 @@ LEARNING_RATE = 0.5 #1e-1
 
 # preferences
 USE_CPU = False # default False, can overwrite
-BUILDING_MODE = True
+BUILDING_MODE = False
 REVIEW_MODE = False
 if BUILDING_MODE:
   TOTAL_DATA = 20
@@ -119,9 +120,9 @@ class LSTMTagger(nn.Module):
         self.pad_idx = pad_idx
 
         # layers
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim).to(device)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True).to(device)
-        self.hidden2tag = nn.Linear(hidden_dim, tagset_size).to(device)
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
+        self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
         self.hidden = self.init_hidden(1) # initialising, number does not matter
 
@@ -129,28 +130,30 @@ class LSTMTagger(nn.Module):
         return (torch.zeros(2, seq_length, self.hidden_dim//2).to(device),
                 torch.zeros(2, seq_length, self.hidden_dim//2).to(device))
 
-    def forward(self, sentence):
+    def forward(self, sentence, orig_seq_lengths):
 
         # print('sentence.shape:', sentence.shape)
         batch_size, seq_len = sentence.size()
-        embeds = self.word_embeddings(sentence).to(device)
+        embeds = self.word_embeddings(sentence)
         # print('embeds.shape:', embeds.shape)
-        embeds = embeds.contiguous().to(device)
+        embeds = embeds.contiguous()
         # print('embeds.shape:', embeds.shape)
-        # input_x = embeds.view(seq_len, -1, batch_size).to(device)
+        # input_x = embeds.view(seq_len, -1, batch_size)
         # print('input_x.shape:', input_x.shape)
-        lstm_out, self.hidden = self.lstm(embeds, self.hidden)
+        packed_input = pack_padded_sequence(embeds, orig_seq_lengths, batch_first=True)
+        packed_output, self.hidden = self.lstm(packed_input, self.hidden)
+        lstm_out, _ = pad_packed_sequence(packed_output, total_length=seq_len, batch_first=True)
         # print('lstm_out.shape:', lstm_out.shape)
         lstm_dropout = self.dropout(lstm_out.contiguous())
         # print('lstm_dropout.shape:', lstm_dropout.shape)
-        tag_space = self.hidden2tag(lstm_dropout).to(device)
+        tag_space = self.hidden2tag(lstm_dropout)
         # print('tag_space.shape:', tag_space.shape)
-        tag_scores = F.log_softmax(tag_space, dim=2).to(device)
+        tag_scores = F.log_softmax(tag_space, dim=2)
         # print('tag_scores.shape:', tag_scores.shape)
         tag_scores = tag_scores.contiguous().view(batch_size, -1, seq_len)
         # print('tag_scores.shape:', tag_scores.shape)
 
-        return tag_scores.to(device)
+        return tag_scores
 
 def load_data_to_generators(train_file):
   """Load data from specified path into train and validate data loaders
@@ -237,7 +240,7 @@ def load_data_to_generators(train_file):
   tokenized_words = np.array(tokenized_words)
   tokenized_tags = np.array(tokenized_tags)
 
-  if BUILDING_MODE:
+  if VAL_PROP>0:
     # Randomly sample
     idx = [i for i in range(len(tokenized_words))]
     random.seed(1234)
@@ -279,14 +282,18 @@ def calc_accuracy(predicted, target_out, batch_size):
   return train_acc
 
 def train_model(train_file, model_file):
-    # write your code here. You can add functions as well.
-	# use torch library to save model parameters, hyperparameters, etc. to model_file
 
+    # load data
     training_generator, validation_generator, word_to_ix, tag_to_ix = load_data_to_generators(train_file)
+    
+    # load model
     model = LSTMTagger(EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix), PAD_IDX, DROPOUT_RATE).to(device)
-    loss_function = nn.CrossEntropyLoss(ignore_index = PAD_IDX).to(device)
-    optimizer = optim.SGD(model.parameters(), lr=0.5)
 
+    # define loss and optimizer
+    loss_function = nn.CrossEntropyLoss(ignore_index = PAD_IDX).to(device)
+    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM)
+
+    # train step
     results_dict = {}
     for epoch in range(NUM_EPOCHS):
         print('Epoch {}'.format(epoch), '-'*80)
@@ -294,24 +301,43 @@ def train_model(train_file, model_file):
         
         for idx, (sentence_in, target_out) in enumerate(training_generator):
 
-            sentence_in = sentence_in.to(device)
-            target_out = target_out.to(device)
-            model.zero_grad()
+            if datetime.datetime.now() - start_time < datetime.timedelta(minutes=MINS_TIME_OUT, seconds=30):
 
-            model.hidden = model.init_hidden(BATCH_SIZE)
-            tag_scores = model(sentence_in).to(device)
-            predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
+                # format batch data
+                sentence_lengths = []
+                for row in sentence_in:
+                    sentence_lengths.append(torch.nonzero(row).shape[0])
+                sentence_lengths = torch.LongTensor(sentence_lengths)
+                seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
+                sentence_in = sentence_in[perm_idx].to(device)
+                target_out = target_out[perm_idx].to(device)
+                seq_lengths = seq_lengths.to(device)
 
-            accuracy = calc_accuracy(predicted, target_out, BATCH_SIZE)
-            loss = loss_function(tag_scores, target_out)
-            loss.backward()
-            optimizer.step()
+                model.zero_grad()
 
-            results['train_loss'].append(loss.data.item())
-            results['train_acc'].append(accuracy)
+                model.hidden = model.init_hidden(BATCH_SIZE)
+                tag_scores = model(sentence_in, seq_lengths)
+                predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
 
-            print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(loss.data.item(),3), round(accuracy*100,3)))
-        
+                accuracy = calc_accuracy(predicted, target_out, BATCH_SIZE)
+                loss = loss_function(tag_scores, target_out)
+                loss.backward()
+                optimizer.step()
+
+                results['train_loss'].append(loss.data.item())
+                results['train_acc'].append(accuracy)
+
+                if idx%PRINT_ROUND==0:
+                    print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(loss.data.item(),3), round(accuracy*100,3)))
+            
+            else:
+                # time out
+                break
+
+        if BUILDING_MODE and epoch%5==0:
+            print(predicted[0])
+            print(target_out[0])
+
         results_dict[epoch] = results
 
     torch.save({
@@ -321,14 +347,14 @@ def train_model(train_file, model_file):
         'word_to_ix': deepcopy(word_to_ix),
         'tag_to_ix': deepcopy(tag_to_ix),
         'embedding_dim': deepcopy(model.embedding_dim),
-        'batch_size' : deepcopy(model.batch_size),
+        'batch_size' : deepcopy(BATCH_SIZE),
         'hidden_dim': deepcopy(model.hidden_dim),
         'dropout_rate': deepcopy(model.dropout_rate),
         'pad_idx': deepcopy(model.pad_idx),
         'ignore_case': IGNORE_CASE,
         }, model_file)
     
-    print("--- %s seconds ---" % (datetime.datetime.now() - startTime))
+    print('Time Taken: {}'.format(datetime.datetime.now() - startTime), '-'*60)
     print('Finished...')
 		
 if __name__ == "__main__":
