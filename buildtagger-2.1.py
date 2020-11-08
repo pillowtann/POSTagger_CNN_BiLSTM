@@ -47,18 +47,19 @@ PAD_IDX = 0
 
 # model
 MAX_SENT_LENGTH = 150 # train max is 141
-MAX_WORD_LENGTH = 30
+MAX_WORD_LENGTH = 100
 NUM_EPOCHS = 10
 
 CNN_IN_CHNL = 1
-CNN_OUT_CHNL = 10
-CNN_KERNEL = MAX_WORD_LENGTH
+CNN_OUT_CHNL = 1
+CH_EMBEDDING_DIM = 5
+CNN_KERNEL = (100, CH_EMBEDDING_DIM)
 CNN_PAD = 1
 CNN_STRIDE = 1
-POOL_KERNEL = 3
+POOL_KERNEL = 2
 POOL_STRIDE = 1
 
-EMBEDDING_DIM = 1000
+EMBEDDING_DIM = 1050
 HIDDEN_DIM = 500
 BATCH_SIZE = 10
 
@@ -120,7 +121,7 @@ class FormatDataset(Dataset):
   def __getitem__(self, index):
     # Step 2. Get our inputs ready for the network, that is, turn them into
     # Tensors of word indices.
-    chars_in = torch.tensor(self.characters_in[index], dtype=torch.float)
+    chars_in = prepare_sequence(self.characters_in[index])
     sentence_in = prepare_sequence(self.processed_in[index])
     target_out = prepare_sequence(self.processed_out[index])
     
@@ -128,16 +129,18 @@ class FormatDataset(Dataset):
 
 class CNNLSTMTagger(nn.Module):
 
-    def __init__(self, embedding_dim, hidden_dim, vocab_size, tagset_size, pad_idx, dropout_rate, 
-    cnn_in_chnl, cnn_out_chnl, cnn_padding, cnn_stride, cnn_kernel_size, pool_kernel_size, pool_stride):
+    def __init__(self, embedding_dim, hidden_dim, chars_size, vocab_size, tagset_size, pad_idx, dropout_rate, 
+    ch_embedding_dim, cnn_in_chnl, cnn_out_chnl, cnn_padding, cnn_stride, cnn_kernel_size, pool_kernel_size, pool_stride):
         super(CNNLSTMTagger, self).__init__()
         # values
         self.hidden_dim = hidden_dim
         self.embedding_dim = embedding_dim
+        self.chars_size  = chars_size  # not used
         self.vocab_size = vocab_size # not used
         self.tagset_size = tagset_size # not used
         self.dropout_rate = dropout_rate # not used
         self.pad_idx = pad_idx
+        self.ch_embedding_dim = ch_embedding_dim # not used
         self.cnn_in_chnl = cnn_in_chnl # not used
         self.cnn_out_chnl = cnn_out_chnl # not used
         self.cnn_padding = cnn_padding # not used
@@ -147,11 +150,13 @@ class CNNLSTMTagger(nn.Module):
         self.pool_stride = pool_stride # not used
 
         # layers
-        self.conv1 = nn.Conv1d(cnn_in_chnl, cnn_out_chnl, stride=cnn_stride, kernel_size=cnn_kernel_size, padding=cnn_padding)
+        self.char_embedding = nn.Embedding(chars_size, ch_embedding_dim, padding_idx = pad_idx)
+        self.conv1 = nn.Conv1d(in_channels=cnn_in_chnl, out_channels=cnn_out_chnl, stride=cnn_stride, kernel_size=cnn_kernel_size, padding=cnn_padding)
+        # self.conv2 = nn.Conv1d(in_channels=cnn_in_chnl, out_channels=cnn_out_chnl, stride=cnn_stride, kernel_size=cnn_kernel_size, padding=cnn_padding)
         self.max_pool = nn.MaxPool1d(kernel_size=pool_kernel_size, stride=pool_stride)
         self.relu = nn.ReLU()
 
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-cnn_out_chnl)
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-(3*2))
         self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
@@ -160,19 +165,22 @@ class CNNLSTMTagger(nn.Module):
     def forward(self, chars_in, sentence, orig_seq_lengths):
 
         batch_size, seq_len, word_len = chars_in.size()
-        # print('chars_in.shape:', chars_in.shape) # torch.Size([5, 150, 30])
+        # print('chars_in.shape:', chars_in.shape) # torch.Size([10, 49, 100])
         # print(chars_in[0])
-        cnn_in = chars_in.contiguous().view(batch_size*seq_len, -1, word_len)
-        # print('cnn_in.shape:', cnn_in.shape) # torch.Size([750, 1, 30])
-        # print(cnn_in[0:5])
-        cnn_out = self.conv1(cnn_in)
-        # print('cnn_out.shape:', cnn_out.shape)
-        # print(cnn_out[0:5])
-        pool_out = self.max_pool(self.relu(cnn_out))
-        # print('pool_out.shape:', pool_out.shape)
+        chars_in = chars_in.contiguous().view(batch_size*seq_len, -1, word_len)
+        # print('chars_in.shape:', chars_in.shape) # torch.Size([490, 1, 100])
+        char_embeds = self.char_embedding(chars_in)
+        # print('char_embeds.shape:', char_embeds.shape) # torch.Size([490, 1, 100, 5])
+        # cnn_in: [batch size, 1, word len, emb dim] # torch.Size([490, 3, 2])
+        cnn1_out = self.relu(self.conv1(char_embeds).squeeze())
+        # print('cnn1_out.shape:', cnn1_out.shape)
+        pool_out = self.max_pool(cnn1_out)
+        # cnn2_out = self.relu(self.conv2(char_embeds).squeeze(3))
+        # print('cnn2_out.shape:', cnn2_out.shape) # torch.Size([750, 1, 30])
+        # print('pool_out.shape:', pool_out.shape) # torch.Size([490, 98, 2])
         # print(pool_out[0:20])
-        cnn_embeds = pool_out.reshape(batch_size, seq_len, self.cnn_out_chnl)
-        # print('cnn_embeds.shape:', cnn_embeds.shape)
+        cnn_embeds = pool_out.reshape(batch_size*seq_len, -1).reshape(batch_size, seq_len, -1)
+        # print('cnn_embeds.shape:', cnn_embeds.shape) # torch.Size([10, 49, 196])
         # print(cnn_embeds[0])
         embeds = self.word_embeddings(sentence)
         # print('embeds.shape:', embeds.shape)
@@ -352,8 +360,8 @@ def train_model(train_file, model_file):
 
     training_generator, validation_generator, char_to_ix, word_to_ix, tag_to_ix = load_data_to_generators(train_file)
     model = CNNLSTMTagger(
-        EMBEDDING_DIM, HIDDEN_DIM, len(word_to_ix), len(tag_to_ix), PAD_IDX, DROPOUT_RATE,
-        CNN_IN_CHNL, CNN_OUT_CHNL, CNN_PAD, CNN_STRIDE, CNN_KERNEL, POOL_KERNEL, POOL_STRIDE
+        EMBEDDING_DIM, HIDDEN_DIM, len(char_to_ix), len(word_to_ix), len(tag_to_ix), PAD_IDX, DROPOUT_RATE,
+        CH_EMBEDDING_DIM, CNN_IN_CHNL, CNN_OUT_CHNL, CNN_PAD, CNN_STRIDE, CNN_KERNEL, POOL_KERNEL, POOL_STRIDE
     ).to(device)
     loss_function = nn.CrossEntropyLoss(ignore_index = PAD_IDX).to(device)
     optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM)
