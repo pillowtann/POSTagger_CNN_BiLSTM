@@ -50,16 +50,14 @@ MAX_SENT_LENGTH = 150 # train max is 141
 MAX_WORD_LENGTH = 100
 NUM_EPOCHS = 10
 
-CNN_IN_CHNL = 1
-CNN_OUT_CHNL = 1
-CH_EMBEDDING_DIM = 5
-CNN_KERNEL = (100, CH_EMBEDDING_DIM)
+CNN_OUT_CHNL = [100, 100]
+CH_EMBEDDING_DIM = 300 #5
+CNN_KERNEL = [3, 5]
 CNN_PAD = 1
 CNN_STRIDE = 1
-POOL_KERNEL = 2
 POOL_STRIDE = 1
 
-EMBEDDING_DIM = 1050
+EMBEDDING_DIM = 1200
 HIDDEN_DIM = 500
 BATCH_SIZE = 10
 
@@ -130,7 +128,7 @@ class FormatDataset(Dataset):
 class CNNLSTMTagger(nn.Module):
 
     def __init__(self, embedding_dim, hidden_dim, chars_size, vocab_size, tagset_size, pad_idx, dropout_rate, 
-    ch_embedding_dim, cnn_in_chnl, cnn_out_chnl, cnn_padding, cnn_stride, cnn_kernel_size, pool_kernel_size, pool_stride):
+    ch_embedding_dim, cnn_out_chnl, cnn_padding, cnn_stride, cnn_kernel_size, pool_stride):
         super(CNNLSTMTagger, self).__init__()
         # values
         self.hidden_dim = hidden_dim
@@ -141,22 +139,24 @@ class CNNLSTMTagger(nn.Module):
         self.dropout_rate = dropout_rate # not used
         self.pad_idx = pad_idx
         self.ch_embedding_dim = ch_embedding_dim # not used
-        self.cnn_in_chnl = cnn_in_chnl # not used
         self.cnn_out_chnl = cnn_out_chnl # not used
         self.cnn_padding = cnn_padding # not used
         self.cnn_stride = cnn_stride # not used
         self.cnn_kernel_size = cnn_kernel_size # not used
-        self.pool_kernel_size = pool_kernel_size # not used
-        self.pool_stride = pool_stride # not used
+        self.pool_stride = pool_stride
 
         # layers
-        self.char_embedding = nn.Embedding(chars_size, ch_embedding_dim, padding_idx = pad_idx)
-        self.conv1 = nn.Conv1d(in_channels=cnn_in_chnl, out_channels=cnn_out_chnl, stride=cnn_stride, kernel_size=cnn_kernel_size, padding=cnn_padding)
-        # self.conv2 = nn.Conv1d(in_channels=cnn_in_chnl, out_channels=cnn_out_chnl, stride=cnn_stride, kernel_size=cnn_kernel_size, padding=cnn_padding)
-        self.max_pool = nn.MaxPool1d(kernel_size=pool_kernel_size, stride=pool_stride)
-        self.relu = nn.ReLU()
 
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-(3*2))
+        self.char_embedding = nn.Embedding(chars_size, ch_embedding_dim, padding_idx = pad_idx)
+        self.conv1d_list = nn.ModuleList([
+            nn.Conv1d(in_channels=ch_embedding_dim,
+                      out_channels=cnn_out_chnl[i],
+                      kernel_size=cnn_kernel_size[i],
+                      padding=cnn_padding,
+                      stride=cnn_stride)
+            for i in range(len(cnn_kernel_size))
+        ])
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-sum(cnn_out_chnl))
         self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
@@ -167,19 +167,16 @@ class CNNLSTMTagger(nn.Module):
         batch_size, seq_len, word_len = chars_in.size()
         # print('chars_in.shape:', chars_in.shape) # torch.Size([10, 49, 100])
         # print(chars_in[0])
-        chars_in = chars_in.contiguous().view(batch_size*seq_len, -1, word_len)
+        chars_in = chars_in.contiguous().view(batch_size*seq_len, word_len)
         # print('chars_in.shape:', chars_in.shape) # torch.Size([490, 1, 100])
-        char_embeds = self.char_embedding(chars_in)
-        # print('char_embeds.shape:', char_embeds.shape) # torch.Size([490, 1, 100, 5])
-        # cnn_in: [batch size, 1, word len, emb dim] # torch.Size([490, 3, 2])
-        cnn1_out = self.relu(self.conv1(char_embeds).squeeze())
-        # print('cnn1_out.shape:', cnn1_out.shape)
-        pool_out = self.max_pool(cnn1_out)
-        # cnn2_out = self.relu(self.conv2(char_embeds).squeeze(3))
-        # print('cnn2_out.shape:', cnn2_out.shape) # torch.Size([750, 1, 30])
-        # print('pool_out.shape:', pool_out.shape) # torch.Size([490, 98, 2])
+        char_embeds = self.char_embedding(chars_in).permute(0, 2, 1)
+        # print('char_embeds.shape:', char_embeds.shape) # (batch_size, num_filters[i], L_out)
+        x_conv_list = [F.relu(conv1d(char_embeds)) for conv1d in self.conv1d_list]
+        x_pool_list = [F.max_pool1d(x_conv, kernel_size=x_conv.shape[2], stride=self.pool_stride) for x_conv in x_conv_list]
+        pool_out = torch.cat([x_pool.squeeze(dim=2) for x_pool in x_pool_list], dim=1)
+        # print('pool_out.shape:', pool_out.shape) # (batch_size, sum(num_filters))
         # print(pool_out[0:20])
-        cnn_embeds = pool_out.reshape(batch_size*seq_len, -1).reshape(batch_size, seq_len, -1)
+        cnn_embeds = pool_out.view(batch_size, seq_len, -1)
         # print('cnn_embeds.shape:', cnn_embeds.shape) # torch.Size([10, 49, 196])
         # print(cnn_embeds[0])
         embeds = self.word_embeddings(sentence)
@@ -361,7 +358,7 @@ def train_model(train_file, model_file):
     training_generator, validation_generator, char_to_ix, word_to_ix, tag_to_ix = load_data_to_generators(train_file)
     model = CNNLSTMTagger(
         EMBEDDING_DIM, HIDDEN_DIM, len(char_to_ix), len(word_to_ix), len(tag_to_ix), PAD_IDX, DROPOUT_RATE,
-        CH_EMBEDDING_DIM, CNN_IN_CHNL, CNN_OUT_CHNL, CNN_PAD, CNN_STRIDE, CNN_KERNEL, POOL_KERNEL, POOL_STRIDE
+        CH_EMBEDDING_DIM, CNN_OUT_CHNL, CNN_PAD, CNN_STRIDE, CNN_KERNEL, POOL_STRIDE
     ).to(device)
     loss_function = nn.CrossEntropyLoss(ignore_index = PAD_IDX).to(device)
     optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM)
@@ -373,7 +370,7 @@ def train_model(train_file, model_file):
         
         for idx, (chars_in, sentence_in, target_out) in enumerate(training_generator):
 
-            if datetime.datetime.now() - start_time > datetime.timedelta(minutes=MINS_TIME_OUT, seconds=40):
+            if datetime.datetime.now() - start_time > datetime.timedelta(minutes=MINS_TIME_OUT, seconds=45):
                 TIME_OUT = True
                 break
 
@@ -423,12 +420,11 @@ def train_model(train_file, model_file):
         'hidden_dim': deepcopy(model.hidden_dim),
         'dropout_rate': deepcopy(model.dropout_rate),
         'pad_idx': deepcopy(model.pad_idx),
-        'cnn_in_chnl': deepcopy(model.cnn_in_chnl),
+        'ch_embedding_dim': deepcopy(model.ch_embedding_dim),
         'cnn_out_chnl': deepcopy(model.cnn_out_chnl),
         'cnn_padding': deepcopy(model.cnn_padding),
         'cnn_stride': deepcopy(model.cnn_stride),
         'cnn_kernel_size': deepcopy(model.cnn_kernel_size),
-        'pool_kernel_size': deepcopy(model.pool_kernel_size),
         'pool_stride': deepcopy(model.pool_stride),
         'ignore_case': IGNORE_CASE,
         }, model_file)
