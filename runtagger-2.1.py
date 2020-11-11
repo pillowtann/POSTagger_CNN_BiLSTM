@@ -41,7 +41,7 @@ else:
 class CNNLSTMTagger(nn.Module):
 
     def __init__(self, embedding_dim, hidden_dim, chars_size, vocab_size, tagset_size, pad_idx, dropout_rate, 
-    ch_embedding_dim, cnn_out_chnl, cnn_padding, cnn_stride, cnn_kernel_size, pool_stride):
+    ch_embedding_dim, cnn_out_chnl, cnn_padding, cnn_stride, cnn_kernel_size, pool_stride, features_dim):
         super(CNNLSTMTagger, self).__init__()
         # values
         self.hidden_dim = hidden_dim
@@ -57,6 +57,7 @@ class CNNLSTMTagger(nn.Module):
         self.cnn_stride = cnn_stride # not used
         self.cnn_kernel_size = cnn_kernel_size # not used
         self.pool_stride = pool_stride
+        self.features_dim = features_dim # not used
 
         # layers
 
@@ -69,13 +70,13 @@ class CNNLSTMTagger(nn.Module):
                       stride=cnn_stride)
             for i in range(len(cnn_kernel_size))
         ])
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-sum(cnn_out_chnl))
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-sum(cnn_out_chnl)-features_dim)
         self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
         
 
-    def forward(self, chars_in, sentence, orig_seq_lengths):
+    def forward(self, chars_in, feats_in, sentence, orig_seq_lengths):
 
         batch_size, seq_len, word_len = chars_in.size()
         # print('chars_in.shape:', chars_in.shape) # torch.Size([10, 49, 100])
@@ -96,7 +97,8 @@ class CNNLSTMTagger(nn.Module):
         # print('embeds.shape:', embeds.shape)
         embeds = embeds.contiguous()
         # print('embeds.shape:', embeds.shape)
-        embeds = torch.cat([embeds, cnn_embeds], dim=2)
+        # print('feats_in.shape:', feats_in.shape)
+        embeds = torch.cat([embeds, cnn_embeds, feats_in.float()], dim=2)
         # print('embeds.shape:', embeds.shape)
         input_x = embeds.transpose(1,0)
         # print('input_x.shape:', input_x.shape)
@@ -187,7 +189,8 @@ def tag_sentence(test_file, model_file, out_file):
         checkpoint['cnn_padding'],
         checkpoint['cnn_stride'],
         checkpoint['cnn_kernel_size'],
-        checkpoint['pool_stride']
+        checkpoint['pool_stride'],
+        checkpoint['features_dim']
         ).to(device)
     model.load_state_dict(checkpoint['state_dict'])
     #optimizer.load_state_dict(checkpoint['optimizer'])
@@ -195,9 +198,11 @@ def tag_sentence(test_file, model_file, out_file):
 
     ##### format data #####
     _chars = []
+    _feats = []
     _test = []
     for row in test:
         row_chars = []
+        row_feats = []
         row_test = []
         for _word in row.split(' '):
             _word = _word.rstrip()
@@ -212,6 +217,16 @@ def tag_sentence(test_file, model_file, out_file):
             else:
                 chars = list(_word)
 
+            # get morphological features (8 features)
+            is_ing = 1 if word[-3:] == 'ing' else 0
+            is_ed = 1 if word[-2:] == 'ed' else 0
+            is_er = 1 if word[-2:] == 'er' else 0
+            is_s = 1 if word[-1:] == 's' else 0
+            is_ly = 1 if word[-2:] == 'ly' else 0
+            un_is = 1 if word[:2] == 'un' else 0
+            is_title = 1 if word[0].isupper() else 0
+            word_feats = [len(chars), is_ing, is_ed, is_er, is_s, is_ly, un_is, is_title]
+
             _tp_char = []
             for ch in chars:
                 if ch not in checkpoint['char_to_ix'].keys():
@@ -225,19 +240,25 @@ def tag_sentence(test_file, model_file, out_file):
                 row_test.append(checkpoint['word_to_ix'][word])
             
             row_chars.append(pad_sequence(_tp_char, pad_value = PAD_IDX, max_seq_length = MAX_WORD_LENGTH))
+            row_feats.append(word_feats)
         
         if len(row_chars)<MAX_SENT_LENGTH:
             _tp_chwords = row_chars + [[PAD_IDX]*MAX_WORD_LENGTH]*(MAX_SENT_LENGTH-len(row_chars))
+            _tp_features = row_feats + [[PAD_IDX]*checkpoint['features_dim']]*(MAX_SENT_LENGTH-len(row_feats))
         else:
             _tp_chwords = row_chars[0:MAX_SENT_LENGTH-1]
+            _tp_features = row_feats[0:MAX_SENT_LENGTH-1]
 
         _chars.append(_tp_chwords) # list to list # list of list to list
+        _feats.append(_tp_features)
         _test.append(pad_sequence(row_test, pad_value = PAD_IDX, max_seq_length = MAX_SENT_LENGTH))
     
-    ch_sentences = torch.tensor(_chars, dtype=torch.long).view(len(test), MAX_SENT_LENGTH, MAX_WORD_LENGTH)
-    sentences = torch.tensor(_test, dtype=torch.long).view(len(test), MAX_SENT_LENGTH)
-    print('ch_sentences.shape:', ch_sentences.shape)
-    print('sentences.shape:', sentences.shape)
+    _chars = torch.tensor(_chars, dtype=torch.long).view(len(test), MAX_SENT_LENGTH, MAX_WORD_LENGTH)
+    _feats = torch.tensor(_feats, dtype=torch.long).view(len(test), MAX_SENT_LENGTH, checkpoint['features_dim'])
+    _test = torch.tensor(_test, dtype=torch.long).view(len(test), MAX_SENT_LENGTH)
+    print('_chars.shape:', _chars.shape)
+    print('_feats.shape:', _feats.shape)
+    print('_test.shape:', _test.shape)
     # print(sentences[0:10])
 
     predicted = []
@@ -245,16 +266,20 @@ def tag_sentence(test_file, model_file, out_file):
     with torch.no_grad():
         # format batch data
         for i in range(0, len(test)//test_batch_size+1):
-            chars_in = ch_sentences[i*test_batch_size:(i+1)*test_batch_size]
-            sentence_in = sentences[i*test_batch_size:(i+1)*test_batch_size]
+            chars_in = _chars[i*test_batch_size:(i+1)*test_batch_size]
+            feats_in = _feats[i*test_batch_size:(i+1)*test_batch_size]
+            sentence_in = _test[i*test_batch_size:(i+1)*test_batch_size]
 
             if sentence_in.shape[0]<test_batch_size:
                 # if not full, add buffer rows
                 n_rows_to_add = test_batch_size-sentence_in.shape[0]
-                chsent_dummy = ch_sentences[0:n_rows_to_add]
+                chsent_dummy = _chars[0:n_rows_to_add]
                 chars_in = torch.cat((chars_in, chsent_dummy), dim=0)
                 print('chars_in.shape:', chars_in.shape)
-                sent_dummy = sentences[0:n_rows_to_add]
+                feats_dummy = _feats[0:n_rows_to_add]
+                feats_in = torch.cat((feats_in, feats_dummy), dim=0)
+                print('feats_in.shape:', feats_in.shape)
+                sent_dummy = _test[0:n_rows_to_add]
                 sentence_in = torch.cat((sentence_in, sent_dummy), dim=0)
                 print('sentence_in.shape:', sentence_in.shape)
 
@@ -265,10 +290,11 @@ def tag_sentence(test_file, model_file, out_file):
             sentence_lengths = torch.LongTensor(sentence_lengths)
             seq_lengths, perm_idx = sentence_lengths.sort(0, descending=True)
             sentence_in = sentence_in[perm_idx].to(device)
+            feats_in = feats_in[perm_idx].to(device)
             chars_in = chars_in[perm_idx].to(device)
 
             # predict
-            tag_scores = model(chars_in, sentence_in, seq_lengths).to(device)
+            tag_scores = model(chars_in, feats_in, sentence_in, seq_lengths).to(device)
             pred = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
             
             # sort back to original order

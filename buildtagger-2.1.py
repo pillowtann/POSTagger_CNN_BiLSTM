@@ -24,10 +24,11 @@ start_time = datetime.datetime.now()
 
 ##### CONSTANTS/SETTINGS #####
 # reproducibility
+SEED_NUM = 1234
 start_time = datetime.datetime.now()
-torch.manual_seed(1234)
-torch.cuda.manual_seed(1234)
-random.seed(1234)
+torch.manual_seed(SEED_NUM)
+torch.cuda.manual_seed(SEED_NUM)
+random.seed(SEED_NUM)
 torch.backends.cudnn.deterministic = True
 
 # data set-up
@@ -57,14 +58,16 @@ CNN_PAD = 1
 CNN_STRIDE = 1
 POOL_STRIDE = 1
 
-EMBEDDING_DIM = 1200
-HIDDEN_DIM = 500
+FEATURES_DIM = 8
+EMBEDDING_DIM = 1500
+HIDDEN_DIM = 650
 BATCH_SIZE = 10
 
-DROPOUT_RATE = 1e-2 # increase slightly to try
+DROPOUT_RATE = 0.05 # increase slightly to try
 MOMENTUM = 0.85 # increase to try (up to 0.9)
 WEIGHT_DECAY = 1e-4 # not used (unless adam)
-LEARNING_RATE = 5e-2
+LEARNING_RATE = 1e-2
+CLIPPING_VALUE = 1
 
 # preferences
 USE_CPU = False # default False, for overwriting
@@ -105,8 +108,9 @@ def pad_tensor(tensor, pad_value = PAD_IDX, max_seq_length = MAX_SENT_LENGTH):
   return fixed_length_tensor
 
 class FormatDataset(Dataset):
-  def __init__(self, characters_in, processed_in, processed_out, word_to_ix, tag_to_ix):
+  def __init__(self, characters_in, features_in, processed_in, processed_out, word_to_ix, tag_to_ix):
     self.characters_in = characters_in
+    self.features_in = features_in
     self.processed_in = processed_in
     self.processed_out = processed_out
     self.word_to_ix = word_to_ix
@@ -120,15 +124,16 @@ class FormatDataset(Dataset):
     # Step 2. Get our inputs ready for the network, that is, turn them into
     # Tensors of word indices.
     chars_in = prepare_sequence(self.characters_in[index])
+    feats_in = prepare_sequence(self.features_in[index])
     sentence_in = prepare_sequence(self.processed_in[index])
     target_out = prepare_sequence(self.processed_out[index])
     
-    return chars_in, sentence_in, target_out
+    return chars_in, feats_in, sentence_in, target_out
 
 class CNNLSTMTagger(nn.Module):
 
     def __init__(self, embedding_dim, hidden_dim, chars_size, vocab_size, tagset_size, pad_idx, dropout_rate, 
-    ch_embedding_dim, cnn_out_chnl, cnn_padding, cnn_stride, cnn_kernel_size, pool_stride):
+    ch_embedding_dim, cnn_out_chnl, cnn_padding, cnn_stride, cnn_kernel_size, pool_stride, features_dim):
         super(CNNLSTMTagger, self).__init__()
         # values
         self.hidden_dim = hidden_dim
@@ -144,6 +149,7 @@ class CNNLSTMTagger(nn.Module):
         self.cnn_stride = cnn_stride # not used
         self.cnn_kernel_size = cnn_kernel_size # not used
         self.pool_stride = pool_stride
+        self.features_dim = features_dim # not used
 
         # layers
 
@@ -156,13 +162,13 @@ class CNNLSTMTagger(nn.Module):
                       stride=cnn_stride)
             for i in range(len(cnn_kernel_size))
         ])
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-sum(cnn_out_chnl))
+        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-sum(cnn_out_chnl)-features_dim)
         self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
         
 
-    def forward(self, chars_in, sentence, orig_seq_lengths):
+    def forward(self, chars_in, feats_in, sentence, orig_seq_lengths):
 
         batch_size, seq_len, word_len = chars_in.size()
         # print('chars_in.shape:', chars_in.shape) # torch.Size([10, 49, 100])
@@ -183,7 +189,8 @@ class CNNLSTMTagger(nn.Module):
         # print('embeds.shape:', embeds.shape)
         embeds = embeds.contiguous()
         # print('embeds.shape:', embeds.shape)
-        embeds = torch.cat([embeds, cnn_embeds], dim=2)
+        # print('feats_in.shape:', feats_in.shape)
+        embeds = torch.cat([embeds, cnn_embeds, feats_in.float()], dim=2)
         # print('embeds.shape:', embeds.shape)
         input_x = embeds.transpose(1,0)
         # print('input_x.shape:', input_x.shape)
@@ -236,6 +243,7 @@ def load_data_to_generators(train_file):
     tokenized_chars = [] # cnn model input
     tokenized_words = [] # lstm model input
     tokenized_tags = [] # model output
+    word_features = [] # lstm model input2
     length_of_sequences = []
 
     for row in data:
@@ -243,6 +251,7 @@ def load_data_to_generators(train_file):
         length_of_sequences.append(len(data_row))
 
         _tokn_row_chars = []
+        _tokn_row_feats = []
         _tokn_row_words = []
         _tokn_row_tags = []
             
@@ -267,6 +276,16 @@ def load_data_to_generators(train_file):
             else:
                 chars = list(_word)
 
+            # get morphological features (8 features)
+            is_ing = 1 if word[-3:] == 'ing' else 0
+            is_ed = 1 if word[-2:] == 'ed' else 0
+            is_er = 1 if word[-2:] == 'er' else 0
+            is_s = 1 if word[-1:] == 's' else 0
+            is_ly = 1 if word[-2:] == 'ly' else 0
+            un_is = 1 if word[:2] == 'un' else 0
+            is_title = 1 if word[0].isupper() else 0
+            word_feats = [len(chars), is_ing, is_ed, is_er, is_s, is_ly, un_is, is_title]
+
             ##### store #####
             # add to char dict if new
             for ch in [c for c in set(chars) if c not in char_to_ix.keys()]:
@@ -283,18 +302,22 @@ def load_data_to_generators(train_file):
             # add tokenized to sequence
             _tokn_row_chars.append(pad_sequence([char_to_ix[c] for c in chars], 
             pad_value = PAD_IDX, max_seq_length = MAX_WORD_LENGTH)) # list to list
+            _tokn_row_feats.append(word_feats) # list to list
             _tokn_row_words.append(word_to_ix[word]) # item to list
             _tokn_row_tags.append(tag_to_ix[tag]) # item to list
         
         # pad_sequence bug, workaround
         if len(_tokn_row_chars)<MAX_SENT_LENGTH:
             _tp_chwords = _tokn_row_chars + [[PAD_IDX]*MAX_WORD_LENGTH]*(MAX_SENT_LENGTH-len(_tokn_row_chars))
+            _tp_features = _tokn_row_feats + [[PAD_IDX]*FEATURES_DIM]*(MAX_SENT_LENGTH-len(_tokn_row_feats))
         else:
             _tp_chwords = _tokn_row_chars[0:MAX_SENT_LENGTH-1]
+            _tp_features = _tokn_row_feats[0:MAX_SENT_LENGTH-1]
         tokenized_chars.append(_tp_chwords) # list to list # list of list to list
         # tokenized_chars.append(
         #     pad_sequence(_tokn_row_chars,
         #     pad_value = [PAD_IDX]*MAX_WORD_LENGTH, max_seq_length = MAX_SENT_LENGTH)) # list of list to list
+        word_features.append(_tp_features)
         tokenized_words.append(
             pad_sequence(_tokn_row_words,
             pad_value = PAD_IDX, max_seq_length = MAX_SENT_LENGTH)) # list to list
@@ -305,6 +328,7 @@ def load_data_to_generators(train_file):
     tokenized_chars = np.array(tokenized_chars)
     tokenized_words = np.array(tokenized_words)
     tokenized_tags = np.array(tokenized_tags)
+    word_features = np.array(word_features)
 
     # print('tokenized_chars.shape', tokenized_chars.shape)
     # print('tokenized_words.shape', tokenized_words.shape)
@@ -313,25 +337,25 @@ def load_data_to_generators(train_file):
     if BUILDING_MODE:
         # Randomly sample
         idx = [i for i in range(len(tokenized_words))]
-        random.seed(1234)
+        random.seed(SEED_NUM)
         random.shuffle(idx)
         split_idx = round(len(data)*VAL_PROP)
         _train_idx = idx[split_idx:]
         _val_idx = idx[0:split_idx]
 
         # Generators
-        training_set = FormatDataset(tokenized_chars[_train_idx], tokenized_words[_train_idx], tokenized_tags[_train_idx], word_to_ix, tag_to_ix)
+        training_set = FormatDataset(tokenized_chars[_train_idx], word_features[_train_idx], tokenized_words[_train_idx], tokenized_tags[_train_idx], word_to_ix, tag_to_ix)
         training_generator = DataLoader(training_set, batch_size=BATCH_SIZE, **GENERATOR_PARAMS)
 
         val_batch_size = len(_val_idx)
-        validation_set = FormatDataset(tokenized_chars[_train_idx], tokenized_words[_val_idx], tokenized_tags[_val_idx], word_to_ix, tag_to_ix)
+        validation_set = FormatDataset(tokenized_chars[_train_idx], word_features[_train_idx], tokenized_words[_val_idx], tokenized_tags[_val_idx], word_to_ix, tag_to_ix)
         validation_generator = DataLoader(validation_set, batch_size=val_batch_size, **GENERATOR_PARAMS)
 
         return training_generator, validation_generator, char_to_ix, word_to_ix, tag_to_ix
   
     else:
         # Generators
-        training_set = FormatDataset(tokenized_chars, tokenized_words, tokenized_tags, word_to_ix, tag_to_ix)
+        training_set = FormatDataset(tokenized_chars, word_features, tokenized_words, tokenized_tags, word_to_ix, tag_to_ix)
         training_generator = DataLoader(training_set, batch_size=BATCH_SIZE, **GENERATOR_PARAMS)
 
         return training_generator, None, char_to_ix, word_to_ix, tag_to_ix
@@ -358,17 +382,18 @@ def train_model(train_file, model_file):
     training_generator, validation_generator, char_to_ix, word_to_ix, tag_to_ix = load_data_to_generators(train_file)
     model = CNNLSTMTagger(
         EMBEDDING_DIM, HIDDEN_DIM, len(char_to_ix), len(word_to_ix), len(tag_to_ix), PAD_IDX, DROPOUT_RATE,
-        CH_EMBEDDING_DIM, CNN_OUT_CHNL, CNN_PAD, CNN_STRIDE, CNN_KERNEL, POOL_STRIDE
+        CH_EMBEDDING_DIM, CNN_OUT_CHNL, CNN_PAD, CNN_STRIDE, CNN_KERNEL, POOL_STRIDE, FEATURES_DIM
     ).to(device)
     loss_function = nn.CrossEntropyLoss(ignore_index = PAD_IDX).to(device)
     optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM)
 
     results_dict = {}
+    best_acc = 0
     for epoch in range(NUM_EPOCHS):
         print('Epoch {}'.format(epoch), '-'*80)
         results = {'train_loss': [], 'train_acc': []}
         
-        for idx, (chars_in, sentence_in, target_out) in enumerate(training_generator):
+        for idx, (chars_in, feats_in, sentence_in, target_out) in enumerate(training_generator):
 
             if datetime.datetime.now() - start_time > datetime.timedelta(minutes=MINS_TIME_OUT, seconds=45):
                 TIME_OUT = True
@@ -384,50 +409,80 @@ def train_model(train_file, model_file):
 
             seq_lengths = seq_lengths.to(device)
             chars_in = torch.narrow(chars_in[perm_idx], dim=1, start=0, length=max_seq_len).to(device)
+            feats_in = torch.narrow(feats_in[perm_idx], dim=1, start=0, length=max_seq_len).to(device)
             sentence_in = torch.narrow(sentence_in[perm_idx], dim=1, start=0, length=max_seq_len).to(device)
             target_out = torch.narrow(target_out[perm_idx], dim=1, start=0, length=max_seq_len).to(device)
             
             model.zero_grad()
 
-            tag_scores = model(chars_in, sentence_in, seq_lengths).to(device)
+            tag_scores = model(chars_in, feats_in, sentence_in, seq_lengths).to(device)
             predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
 
             accuracy = calc_accuracy(predicted, target_out, BATCH_SIZE)
 
             loss = loss_function(tag_scores, target_out)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIPPING_VALUE)
+
             optimizer.step()
 
             results['train_loss'].append(loss.data.item())
             results['train_acc'].append(accuracy)
 
             if idx%PRINT_ROUND==0:
-                print('Step {} | Training Loss: {}, Accuracy: {}%'.format(idx, round(loss.data.item(),3), round(accuracy*100,3)))
-        
+                avg_acc = sum(results['train_acc'][-PRINT_ROUND:])/PRINT_ROUND
+                print('Step {} | Training Loss: {}, Accuracy: {}%, Avg_Acc: {}%'.format(idx, round(loss.data.item(),3), round(accuracy*100,3), round(avg_acc*100,3)))
+
+                if (idx>600) and (best_acc<avg_acc):
+                    best_acc = avg_acc
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'state_dict': model.state_dict(),
+                        'optimizer' : optimizer.state_dict(),
+                        'word_to_ix': deepcopy(word_to_ix),
+                        'tag_to_ix': deepcopy(tag_to_ix),
+                        'char_to_ix': deepcopy(char_to_ix),
+                        'embedding_dim': deepcopy(model.embedding_dim),
+                        'hidden_dim': deepcopy(model.hidden_dim),
+                        'dropout_rate': deepcopy(model.dropout_rate),
+                        'pad_idx': deepcopy(model.pad_idx),
+                        'ch_embedding_dim': deepcopy(model.ch_embedding_dim),
+                        'cnn_out_chnl': deepcopy(model.cnn_out_chnl),
+                        'cnn_padding': deepcopy(model.cnn_padding),
+                        'cnn_stride': deepcopy(model.cnn_stride),
+                        'cnn_kernel_size': deepcopy(model.cnn_kernel_size),
+                        'pool_stride': deepcopy(model.pool_stride),
+                        'features_dim': deepcopy(model.features_dim),
+                        'ignore_case': IGNORE_CASE,
+                        }, model_file)
+
         if TIME_OUT:
             break
 
         results_dict[epoch] = results
 
-    torch.save({
-        'epoch': epoch + 1,
-        'state_dict': model.state_dict(),
-        'optimizer' : optimizer.state_dict(),
-        'word_to_ix': deepcopy(word_to_ix),
-        'tag_to_ix': deepcopy(tag_to_ix),
-        'char_to_ix': deepcopy(char_to_ix),
-        'embedding_dim': deepcopy(model.embedding_dim),
-        'hidden_dim': deepcopy(model.hidden_dim),
-        'dropout_rate': deepcopy(model.dropout_rate),
-        'pad_idx': deepcopy(model.pad_idx),
-        'ch_embedding_dim': deepcopy(model.ch_embedding_dim),
-        'cnn_out_chnl': deepcopy(model.cnn_out_chnl),
-        'cnn_padding': deepcopy(model.cnn_padding),
-        'cnn_stride': deepcopy(model.cnn_stride),
-        'cnn_kernel_size': deepcopy(model.cnn_kernel_size),
-        'pool_stride': deepcopy(model.pool_stride),
-        'ignore_case': IGNORE_CASE,
-        }, model_file)
+    # last check to save
+    if idx%PRINT_ROUND!=0 and best_acc<accuracy:
+        torch.save({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'optimizer' : optimizer.state_dict(),
+            'word_to_ix': deepcopy(word_to_ix),
+            'tag_to_ix': deepcopy(tag_to_ix),
+            'char_to_ix': deepcopy(char_to_ix),
+            'embedding_dim': deepcopy(model.embedding_dim),
+            'hidden_dim': deepcopy(model.hidden_dim),
+            'dropout_rate': deepcopy(model.dropout_rate),
+            'pad_idx': deepcopy(model.pad_idx),
+            'ch_embedding_dim': deepcopy(model.ch_embedding_dim),
+            'cnn_out_chnl': deepcopy(model.cnn_out_chnl),
+            'cnn_padding': deepcopy(model.cnn_padding),
+            'cnn_stride': deepcopy(model.cnn_stride),
+            'cnn_kernel_size': deepcopy(model.cnn_kernel_size),
+            'pool_stride': deepcopy(model.pool_stride),
+            'features_dim': deepcopy(model.features_dim),
+            'ignore_case': IGNORE_CASE,
+            }, model_file)
 
     print('Time Taken: {}'.format(datetime.datetime.now() - start_time), '-'*60)
     print('Finished...')
