@@ -64,12 +64,12 @@ FEATURES_DIM = 8
 EMBEDDING_DIM = 1500
 HIDDEN_DIM = 650
 HIDDEN_ATTN_DIM = 24
-BATCH_SIZE = 5
+BATCH_SIZE = 10
 
 DROPOUT_RATE = 0.05 # increase slightly to try
 MOMENTUM = 0.85 # increase to try (up to 0.9)
 WEIGHT_DECAY = 1e-4 # not used (unless adam)
-LEARNING_RATE = 1e-2
+LEARNING_RATE = 0.5
 CLIPPING_VALUE = 1
 
 # preferences
@@ -171,6 +171,10 @@ class CNNLSTMTagger(nn.Module):
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
 
+        self.attn = nn.Linear(hidden_dim, MAX_SENT_LENGTH)
+        self.attn_combine = nn.Linear(hidden_dim, hidden_dim)
+        self.gru = nn.GRU(hidden_dim, hidden_dim)
+
     def attention(self, rnn_out, state):
         # print('rnn_out.shape:', rnn_out.shape)
         merged_state = torch.cat([s for s in state], dim=2)
@@ -221,26 +225,52 @@ class CNNLSTMTagger(nn.Module):
         # print('packed_output.data.shape:', packed_output.data.shape)
         lstm_out, input_sizes = pad_packed_sequence(packed_output, total_length=seq_len, batch_first=False)
         # print('lstm_out.shape:', lstm_out.shape)
-        # hidden = torch.cat([hidden[-1], hidden[-2]], dim=2)
+        hidden = torch.cat([hidden[-1], hidden[-2]], dim=2)
         # print('hidden.shape:', hidden.shape)
         lstm_out = lstm_out.contiguous().permute(1,0,2)
         # print('lstm_out.shape:', lstm_out.shape)
-        lstm_attn = self.attention(lstm_out, hidden)
-        # print('lstm_attn.shape:', lstm_attn.shape)
-        lstm_attn = lstm_attn.contiguous().permute(0,2,1)
-        # print('lstm_attn.shape:', lstm_attn.shape)
-        embeddings = lstm_out + torch.narrow(lstm_attn, dim=1, start=0, length=1) + torch.narrow(lstm_attn, dim=1, start=1, length=1)
-        # print('lstm_dropout.shape:', lstm_dropout.shape)
-        # embeddings = torch.cat([embeds, lstm_attn], dim=2)
-        # print('embeddings.shape:', embeddings.shape)
-        tag_space = self.hidden2tag(embeddings.contiguous().permute(1,0,2))
+        lstm_out = self.dropout(lstm_out)
+        # print('lstm_out.shape:', lstm_out.shape)
+        attn_weights = F.softmax(self.attn(hidden), dim=1)
+        attn_weights = torch.narrow(attn_weights, dim=2, start=0, length=seq_len)
+        # print('attn_weights.shape:', attn_weights.shape)
+        # (batch, seq_len, cell_size) * (batch, cell_size, 2) = (batch, seq_len, 2)
+        attn_applied = torch.bmm(attn_weights.permute(1,0,2), lstm_out)
+        # print('attn_applied.shape:', attn_applied.shape)
+        # print('attn_appliedsum.shape:', torch.sum(attn_applied, dim=1).shape)
+        output = lstm_out + torch.sum(attn_applied, dim=1).unsqueeze(1) #torch.cat((embedded, attn_applied), dim=1)
+        # print('output.shape:', output.shape)  
+        # output = self.attn_combine(output)
+        # print('output.shape:', output.shape) 
+        # output = F.relu(output)
+        # print('output.shape:', output.shape) 
+        # output, _ = self.gru(output)
+        # print('output.shape:', output.shape)
+        tag_space = self.hidden2tag(output)
         # print('tag_space.shape:', tag_space.shape)
-        tag_scores = F.log_softmax(tag_space, dim=1)
+        tag_scores = F.log_softmax(tag_space, dim=2)
         # print('tag_scores.shape:', tag_scores.shape)
-        tag_scores = tag_scores.permute(1,2,0).contiguous()
+        tag_scores = tag_scores.permute(0,2,1).contiguous()
         # print('tag_scores.shape:', tag_scores.shape)
-
         return tag_scores
+
+
+        # lstm_attn = self.attention(lstm_out, hidden)
+        # # print('lstm_attn.shape:', lstm_attn.shape)
+        # lstm_attn = lstm_attn.contiguous().permute(0,2,1)
+        # # print('lstm_attn.shape:', lstm_attn.shape)
+        # embeddings = lstm_out + torch.narrow(lstm_attn, dim=1, start=0, length=1) + torch.narrow(lstm_attn, dim=1, start=1, length=1)
+        # # print('lstm_dropout.shape:', lstm_dropout.shape)
+        # # embeddings = torch.cat([embeds, lstm_attn], dim=2)
+        # # print('embeddings.shape:', embeddings.shape)
+        # tag_space = self.hidden2tag(embeddings.contiguous().permute(1,0,2))
+        # # print('tag_space.shape:', tag_space.shape)
+        # tag_scores = F.log_softmax(tag_space, dim=1)
+        # # print('tag_scores.shape:', tag_scores.shape)
+        # tag_scores = tag_scores.permute(1,2,0).contiguous()
+        # # print('tag_scores.shape:', tag_scores.shape)
+
+        # return tag_scores
 
 def load_data_to_generators(train_file):
     """Load data from specified path into train and validate data loaders
