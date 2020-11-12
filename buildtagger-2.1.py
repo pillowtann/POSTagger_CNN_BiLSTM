@@ -18,6 +18,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 import torch.optim as optim
+from torch.autograd import Variable
+from torch.nn.parameter import Parameter
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 torch.set_printoptions(profile="full")
 start_time = datetime.datetime.now()
@@ -61,6 +63,7 @@ POOL_STRIDE = 1
 FEATURES_DIM = 8
 EMBEDDING_DIM = 1500
 HIDDEN_DIM = 650
+HIDDEN_ATTN_DIM = 24
 BATCH_SIZE = 10
 
 DROPOUT_RATE = 0.05 # increase slightly to try
@@ -130,6 +133,7 @@ class FormatDataset(Dataset):
     
     return chars_in, feats_in, sentence_in, target_out
 
+
 class CNNLSTMTagger(nn.Module):
 
     def __init__(self, embedding_dim, hidden_dim, chars_size, vocab_size, tagset_size, pad_idx, dropout_rate, 
@@ -163,14 +167,39 @@ class CNNLSTMTagger(nn.Module):
             for i in range(len(cnn_kernel_size))
         ])
         self.word_embeddings = nn.Embedding(vocab_size, embedding_dim-sum(cnn_out_chnl)-features_dim)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
+        self.bilstm = nn.LSTM(embedding_dim, hidden_dim//2, batch_first=True, bidirectional=True)
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
-        
 
-    def forward(self, chars_in, feats_in, sentence, orig_seq_lengths):
+    def attention(self, query, keys):
+        # Hidden: Query = [BxM]
+        # LSTM_Out: Keys = [TxBxM]
+        # Outputs = a:[TxB], lin_comb:[BxV]
+        # Here we assume q_dim == k_dim (dot product attention)
+        scale = 1. / math.sqrt(query.shape[2])
+        query = query.permute(1,2,0) # [NxBxM] -> [BxMxN] BatchSize x Feats x 2
+        keys = keys.permute(1,0,2) # [TxBxM] -> [BxTxM] BatchSize x SeqLen x Feats
+        # print('query.shape:', query.shape)
+        # print('keys.shape:', keys.shape)
+        energy = torch.bmm(keys, query) # [BxTxM]x[BxMxN] -> [BxTxN] 
+        energy = F.softmax(energy.mul_(scale), dim=2) # scale, normalize
+        values = query.permute(0,2,1) # [BxMxN] -> [BxNxM]
+        # values = values.transpose(0,1) # [TxBxV] -> [BxTxV]
+        # print('energy.shape:', energy.shape)
+        # print('values.shape:', values.shape)
+        linear_combination = torch.bmm(energy, values) #[BxTxN]x[BxNxM] -> [BxTxM] BatchSize x SeqLen x Feats
+        return energy, linear_combination
+
+
+    def init_hidden(self, batch_size):
+        h0 = Variable(torch.zeros(2, batch_size, self.hidden_dim // 2).to(device))
+        c0 = Variable(torch.zeros(2, batch_size, self.hidden_dim // 2).to(device))
+        return (h0, c0)
+
+    def forward(self, chars_in, feats_in, sentence, orig_seq_lengths, encoder_outputs):
 
         batch_size, seq_len, word_len = chars_in.size()
+        hidden= self.init_hidden(batch_size)
         # print('chars_in.shape:', chars_in.shape) # torch.Size([10, 49, 100])
         # print(chars_in[0])
         chars_in = chars_in.contiguous().view(batch_size*seq_len, word_len)
@@ -187,7 +216,7 @@ class CNNLSTMTagger(nn.Module):
         # print(cnn_embeds[0])
         embeds = self.word_embeddings(sentence)
         # print('embeds.shape:', embeds.shape)
-        embeds = embeds.contiguous()
+        embeds = self.dropout(embeds.contiguous())
         # print('embeds.shape:', embeds.shape)
         # print('feats_in.shape:', feats_in.shape)
         embeds = torch.cat([embeds, cnn_embeds, feats_in.float()], dim=2)
@@ -196,15 +225,21 @@ class CNNLSTMTagger(nn.Module):
         # print('input_x.shape:', input_x.shape)
         packed_input = pack_padded_sequence(input_x, orig_seq_lengths, batch_first=False)
         # print('packed_input.data.shape:', packed_input.data.shape)
-        packed_output, (ht, ct) = self.lstm(packed_input)
+        packed_output, hidden = self.bilstm(packed_input, hidden)
         # print('packed_output.data.shape:', packed_output.data.shape)
         lstm_out, input_sizes = pad_packed_sequence(packed_output, total_length=seq_len, batch_first=False)
         # print('lstm_out.shape:', lstm_out.shape)
-        lstm_dropout = self.dropout(lstm_out.contiguous())
+        hidden = torch.cat([hidden[-1], hidden[-2]], dim=2)
+        # print('hidden.shape:', hidden.shape)
+        energy, lstm_attn = self.attention(hidden, lstm_out) 
+        # print('lstm_attn.shape:', lstm_attn.shape)
+        # lstm_dropout = self.dropout(lstm_out.contiguous())
         # print('lstm_dropout.shape:', lstm_dropout.shape)
-        tag_space = self.hidden2tag(lstm_dropout)
+        lstm_attn = lstm_attn.permute(1,0,2).contiguous()
+        # print('lstm_attn.shape:', lstm_attn.shape)
+        tag_space = self.hidden2tag(lstm_attn)
         # print('tag_space.shape:', tag_space.shape)
-        tag_scores = F.log_softmax(tag_space, dim=2)
+        tag_scores = F.log_softmax(tag_space, dim=1)
         # print('tag_scores.shape:', tag_scores.shape)
         tag_scores = tag_scores.permute(1,2,0).contiguous()
         # print('tag_scores.shape:', tag_scores.shape)
@@ -415,7 +450,7 @@ def train_model(train_file, model_file):
             
             model.zero_grad()
 
-            tag_scores = model(chars_in, feats_in, sentence_in, seq_lengths).to(device)
+            tag_scores = model(chars_in, feats_in, sentence_in, seq_lengths, target_out).to(device)
             predicted = torch.argmax(tag_scores, dim=1).detach().cpu().numpy()
 
             accuracy = calc_accuracy(predicted, target_out, BATCH_SIZE)
