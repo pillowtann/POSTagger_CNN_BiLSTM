@@ -64,7 +64,7 @@ FEATURES_DIM = 8
 EMBEDDING_DIM = 1500
 HIDDEN_DIM = 650
 HIDDEN_ATTN_DIM = 24
-BATCH_SIZE = 10
+BATCH_SIZE = 5
 
 DROPOUT_RATE = 0.05 # increase slightly to try
 MOMENTUM = 0.85 # increase to try (up to 0.9)
@@ -171,25 +171,17 @@ class CNNLSTMTagger(nn.Module):
         self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.dropout = nn.Dropout(dropout_rate)
 
-    def attention(self, query, keys):
-        # Hidden: Query = [BxM]
-        # LSTM_Out: Keys = [TxBxM]
-        # Outputs = a:[TxB], lin_comb:[BxV]
-        # Here we assume q_dim == k_dim (dot product attention)
-        scale = 1. / math.sqrt(query.shape[2])
-        query = query.permute(1,2,0) # [NxBxM] -> [BxMxN] BatchSize x Feats x 2
-        keys = keys.permute(1,0,2) # [TxBxM] -> [BxTxM] BatchSize x SeqLen x Feats
-        # print('query.shape:', query.shape)
-        # print('keys.shape:', keys.shape)
-        energy = torch.bmm(keys, query) # [BxTxM]x[BxMxN] -> [BxTxN] 
-        energy = F.softmax(energy.mul_(scale), dim=2) # scale, normalize
-        values = query.permute(0,2,1) # [BxMxN] -> [BxNxM]
-        # values = values.transpose(0,1) # [TxBxV] -> [BxTxV]
-        # print('energy.shape:', energy.shape)
-        # print('values.shape:', values.shape)
-        linear_combination = torch.bmm(energy, values) #[BxTxN]x[BxNxM] -> [BxTxM] BatchSize x SeqLen x Feats
-        return energy, linear_combination
-
+    def attention(self, rnn_out, state):
+        # print('rnn_out.shape:', rnn_out.shape)
+        merged_state = torch.cat([s for s in state], dim=2)
+        merged_state = merged_state.squeeze(0).permute(1,2,0)
+        # print('merged_state.shape:', merged_state.shape)
+        # (batch, seq_len, cell_size) * (batch, cell_size, 2) = (batch, seq_len, 2)
+        weights = torch.bmm(rnn_out, merged_state)
+        weights = torch.nn.functional.softmax(weights.squeeze(2), dim=1)
+        # print('weights.shape:', weights.shape)
+        # (batch, cell_size, seq_len) * (batch, seq_len, 2) = (batch, cell_size, 2)
+        return torch.bmm(rnn_out.permute(0,2,1), weights).squeeze(2)
 
     def init_hidden(self, batch_size):
         h0 = Variable(torch.zeros(2, batch_size, self.hidden_dim // 2).to(device))
@@ -229,15 +221,19 @@ class CNNLSTMTagger(nn.Module):
         # print('packed_output.data.shape:', packed_output.data.shape)
         lstm_out, input_sizes = pad_packed_sequence(packed_output, total_length=seq_len, batch_first=False)
         # print('lstm_out.shape:', lstm_out.shape)
-        hidden = torch.cat([hidden[-1], hidden[-2]], dim=2)
+        # hidden = torch.cat([hidden[-1], hidden[-2]], dim=2)
         # print('hidden.shape:', hidden.shape)
-        energy, lstm_attn = self.attention(hidden, lstm_out) 
+        lstm_out = lstm_out.contiguous().permute(1,0,2)
+        # print('lstm_out.shape:', lstm_out.shape)
+        lstm_attn = self.attention(lstm_out, hidden)
         # print('lstm_attn.shape:', lstm_attn.shape)
-        # lstm_dropout = self.dropout(lstm_out.contiguous())
+        lstm_attn = lstm_attn.contiguous().permute(0,2,1)
+        # print('lstm_attn.shape:', lstm_attn.shape)
+        embeddings = lstm_out + torch.narrow(lstm_attn, dim=1, start=0, length=1) + torch.narrow(lstm_attn, dim=1, start=1, length=1)
         # print('lstm_dropout.shape:', lstm_dropout.shape)
-        lstm_attn = lstm_attn.permute(1,0,2).contiguous()
-        # print('lstm_attn.shape:', lstm_attn.shape)
-        tag_space = self.hidden2tag(lstm_attn)
+        # embeddings = torch.cat([embeds, lstm_attn], dim=2)
+        # print('embeddings.shape:', embeddings.shape)
+        tag_space = self.hidden2tag(embeddings.contiguous().permute(1,0,2))
         # print('tag_space.shape:', tag_space.shape)
         tag_scores = F.log_softmax(tag_space, dim=1)
         # print('tag_scores.shape:', tag_scores.shape)
